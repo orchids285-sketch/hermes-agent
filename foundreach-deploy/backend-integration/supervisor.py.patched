@@ -1,0 +1,107 @@
+"""Supervisor LangGraph — multi-agent topology for ONE ICP per tick.
+
+  scraper ─> evaluator ──(needs_broaden=False)──> enrich ─> dispatch ─┐
+                  └────(needs_broaden=True)──> broaden ─> enrich ─> dispatch
+                                                          └─> notify ─> pipeline ─> finalize ─> END
+
+This is the supervisor used by the continuous-agent worker. Each ICP gets
+its own run through the graph; the worker holds a Postgres advisory lock
+for the ICP id so only one supervisor runs at a time per ICP.
+"""
+from __future__ import annotations
+import time
+import uuid
+from typing import Any
+
+from lib.logger import get_logger
+
+log = get_logger()
+
+
+def _build_graph_lazy():
+    """Build the StateGraph on first use. langgraph is optional — if not
+    installed we expose `run_for_icp` as a sequential fallback."""
+    try:
+        from langgraph.graph import StateGraph, END, START
+    except ImportError:
+        return None
+
+    from .supervisor_state import ICPTickState
+    from . import supervisor_nodes as n
+
+    g = StateGraph(ICPTickState)
+
+    g.add_node("scraper",    n.scraper_agent)
+    g.add_node("evaluator",  n.evaluator_agent)
+    g.add_node("broaden",    n.broaden_agent)
+    g.add_node("enrich",     n.enricher_agent)
+    g.add_node("gate",       n.gate_agent)      # ← Hermes quality gate before outreach (advisory by default)
+    g.add_node("dispatch",   n.dispatcher_agent)
+    g.add_node("notify",     n.notifier_agent)
+    g.add_node("pipeline",   n.pipeline_agent)
+    g.add_node("finalize",   n.finalize_agent)
+
+    g.add_edge(START, "scraper")
+    g.add_edge("scraper", "evaluator")
+    g.add_conditional_edges("evaluator", n.route_after_evaluate, {
+        "broaden": "broaden",
+        "enrich":  "enrich",
+    })
+    g.add_edge("broaden", "enrich")
+    g.add_edge("enrich",   "gate")
+    g.add_conditional_edges("gate", n.route_after_gate, {
+        "refine": "broaden",   # block-mode + low score → one broaden for better leads
+        "ok":     "dispatch",
+    })
+    g.add_edge("dispatch", "notify")
+    g.add_edge("notify",   "pipeline")
+    g.add_edge("pipeline", "finalize")
+    g.add_edge("finalize", END)
+    return g.compile()
+
+
+_compiled = None
+
+
+def get_supervisor():
+    global _compiled
+    if _compiled is None:
+        _compiled = _build_graph_lazy()
+    return _compiled
+
+
+def run_for_icp(icp: dict[str, Any]) -> dict[str, Any]:
+    """Run the supervisor graph for a single ICP. Falls back to a sequential
+    pipeline if langgraph is not installed."""
+    since_ts = 0.0
+    last = icp.get("last_scanned_at")
+    if last:
+        try:
+            since_ts = float(last.timestamp())
+        except Exception:
+            since_ts = 0.0
+    initial: dict[str, Any] = {
+        "icp": icp,
+        "since_ts": since_ts,
+        "tick_id": uuid.uuid4().hex[:12],
+        "status": "running",
+    }
+    t0 = time.time()
+    graph = get_supervisor()
+    if graph is None:
+        # Sequential fallback (no langgraph available)
+        log.info("supervisor: langgraph not available, running sequential fallback")
+        from . import supervisor_nodes as n
+        state = dict(initial)
+        for step in (n.scraper_agent, n.evaluator_agent):
+            state.update(step(state) or {})
+        if state.get("needs_broaden"):
+            state.update(n.broaden_agent(state) or {})
+        for step in (n.enricher_agent, n.gate_agent, n.dispatcher_agent,
+                     n.notifier_agent, n.pipeline_agent, n.finalize_agent):
+            state.update(step(state) or {})
+        state["duration_ms"] = int((time.time() - t0) * 1000)
+        return state
+    out = graph.invoke(initial)
+    out["duration_ms"] = int((time.time() - t0) * 1000)
+    return out

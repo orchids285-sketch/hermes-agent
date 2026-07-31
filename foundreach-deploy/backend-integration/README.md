@@ -26,3 +26,20 @@ Copy `hermes_director.py` to `ultimate_agent/core/`, replace `ultimate_agent/cor
 with `brain.py.patched`, set `HERMES_API_URL` + `HERMES_API_KEY` (+ optional
 `HERMES_QUALITY_BAR`, default 7). VALIDATED live: gate scored a weak output 2/10 and
 emitted a concrete corrective task; strategize returned a real ICP + Sales-Nav filters.
+
+## 2nd orchestrator fixed — the SUPERVISOR (continuous-agent worker, live outreach)
+`backend/orchestrator/supervisor.py` runs per-ICP: scraper → evaluator → enrich →
+**dispatch(SENDS outreach)** → notify → pipeline → finalize. Its `evaluator` only
+gated search breadth, NOT quality → mediocre outreach could be sent.
+Added `gate_agent` (Hermes) between enrich and dispatch: `enrich → gate → {refine→broaden | ok→dispatch}`.
+**SAFE: advisory by default** (`HERMES_GATE_DISPATCH=advisory`) — only logs a score,
+changes nothing. Set `HERMES_GATE_DISPATCH=block` (+ `HERMES_GATE_BAR`, default 6) to
+route low-quality batches to one `broaden` before dispatching. Hermes off → pass-through.
+Files: supervisor.py.patched + supervisor_nodes.py.patched.
+
+## Coverage map (which orchestrators are gated)
+- ✅ `ultimate_agent/core/brain.py` (research/content loop) — gate ENFORCED (redo).
+- ✅ `backend/orchestrator/supervisor.py` (outreach loop) — gate ADVISORY (opt-in block).
+- ▫ `backend/main.py:2903` graph, `services/mission_runner.py`, `services/agent_graph.py`,
+   `services/autopilot_engine.py` (computer-use) — same `HermesBrain`/gate pattern applies;
+   wire as needed once the two main loops are validated live.

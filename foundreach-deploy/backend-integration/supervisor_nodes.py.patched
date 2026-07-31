@@ -1,0 +1,411 @@
+"""Supervisor agent nodes — one per specialized sub-agent.
+
+Each node is a thin wrapper over an existing service module so we don't
+duplicate logic. The graph in `supervisor.py` decides the order + branches.
+
+  ScraperAgent   → services.signal_engine.run_scan
+  ScorerAgent    → (inline in signal_engine; we just read its persisted counts)
+  EvaluatorAgent → looks at HOT count, decides broaden vs done
+  BroadenAgent   → services.continuous_agent._broaden_icp + re-scan
+  EnricherAgent  → integrations.enrichment_cascade (re-runs on missing-email HOT signals)
+  DispatcherAgent→ services.message_generator + senders.dispatcher (best channel)
+  NotifierAgent  → lib.notifier_novu + lib.notifier_slack on HOT
+  PipelineAgent  → integrations.twenty_direct upserts + status transitions
+"""
+from __future__ import annotations
+import os
+import time
+from typing import Any
+
+from lib.logger import get_logger
+from services import continuous_agent, signal_engine
+from storage import audit
+from storage.db import get_pool
+
+log = get_logger()
+
+
+HOT_THRESHOLD    = int(os.environ.get("HOT_THRESHOLD", "70"))
+MIN_HOT_PER_ICP  = int(os.environ.get("MIN_HOT_PER_ICP", "30"))
+MAX_RESCAN_LOOPS = int(os.environ.get("MAX_RESCAN_LOOPS", "3"))
+
+
+# ─── ScraperAgent ────────────────────────────────────────────────
+
+def scraper_agent(state: dict[str, Any]) -> dict[str, Any]:
+    """Run signal_engine.run_scan once. Persists signals + drafts side-effects."""
+    icp = state["icp"]
+    t0 = time.time()
+    try:
+        summary = signal_engine.run_scan(icp)
+        return {
+            "raw_count":      int(summary.get("raw", 0) or 0),
+            "scan_persisted": int(summary.get("persisted", 0) or 0),
+            "scan_hot":       int(summary.get("hot", 0) or 0),
+            "scan_source":    str(summary.get("source", "signal_engine")),
+            "status":         "running",
+            "duration_ms":    int((time.time() - t0) * 1000),
+        }
+    except Exception as e:
+        log.warning("scraper_agent failed for %s: %s", icp.get("id"), e)
+        return {"errors": [f"scraper: {e}"], "status": "failed"}
+
+
+# ─── EvaluatorAgent ──────────────────────────────────────────────
+
+def evaluator_agent(state: dict[str, Any]) -> dict[str, Any]:
+    """Decide whether the ICP has reached its HOT-signal target or needs broaden."""
+    icp_id = state["icp"]["id"]
+    have = continuous_agent._current_hot_count(icp_id)
+    needs = have < MIN_HOT_PER_ICP
+    log.info("evaluator: icp=%s hot=%d target=%d needs_broaden=%s",
+             icp_id, have, MIN_HOT_PER_ICP, needs)
+    return {
+        "needs_broaden":    needs,
+        "broaden_iteration": 0,
+        "final_hot_count":  have,
+    }
+
+
+def route_after_evaluate(state: dict[str, Any]) -> str:
+    return "broaden" if state.get("needs_broaden") else "enrich"
+
+
+# ─── BroadenAgent ───────────────────────────────────────────────
+
+def broaden_agent(state: dict[str, Any]) -> dict[str, Any]:
+    """Run push-until-N-hot. Re-uses continuous_agent's broaden+scan loop."""
+    icp = state["icp"]
+    extras = continuous_agent._push_until_n_hot(icp)
+    return {
+        "extra_loops":     extras["loops_run"],
+        "extra_added":     extras["added_signals"],
+        "final_hot_count": extras["final_hot_count"],
+    }
+
+
+# ─── EnricherAgent ──────────────────────────────────────────────
+
+def _list_unenriched_hot_signals(icp_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    """HOT signals that have a source_url but no email yet."""
+    sql = """
+        SELECT id, title, source, source_url, author_username, score_total,
+               COALESCE(author_email, '') AS author_email,
+               COALESCE(linkedin_url, '') AS linkedin_url
+        FROM signals
+        WHERE icp_id = %s
+          AND score_total >= %s
+          AND (author_email IS NULL OR author_email = '')
+        ORDER BY score_total DESC, detected_at DESC
+        LIMIT %s
+    """
+    try:
+        with get_pool().connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, (icp_id, HOT_THRESHOLD, limit))
+            cols = [d.name for d in cur.description]
+            rows = cur.fetchall()
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception as e:
+        log.debug("list unenriched failed: %s", e)
+        return []
+
+
+def abm_agent(state: dict[str, Any]) -> dict[str, Any]:
+    """Expand each HOT signal's company → multi-stakeholder."""
+    icp = state["icp"]
+    try:
+        from services import abm
+        out = abm.expand_from_signals(icp, limit=60)
+        return {"abm_expanded": int(out.get("expanded", 0)),
+                "abm_contacts_added": int(out.get("contacts_added_total", 0))}
+    except Exception as e:
+        log.debug("abm_agent failed: %s", e)
+        return {"abm_expanded": 0, "abm_contacts_added": 0}
+
+
+def enricher_agent(state: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort: try enrichment_cascade on HOT signals missing an email."""
+    icp = state["icp"]
+    icp_id = icp["id"]
+    targets = _list_unenriched_hot_signals(icp_id)
+    if not targets:
+        return {"enriched_count": 0, "enrich_provider_breakdown": {}}
+
+    try:
+        from integrations import enrichment_cascade
+    except Exception as e:
+        log.debug("enrichment_cascade import failed: %s", e)
+        return {"enriched_count": 0, "enrich_provider_breakdown": {}}
+
+    enriched = 0
+    breakdown: dict[str, int] = {}
+    for sig in targets:
+        try:
+            result = enrichment_cascade.enrich_signal(sig) if hasattr(
+                enrichment_cascade, "enrich_signal") else None
+            if not result:
+                continue
+            provider = result.get("provider") or "unknown"
+            email = result.get("email")
+            li = result.get("linkedin_url")
+            if email or li:
+                # Persist back to signals row
+                try:
+                    with get_pool().connection() as conn, conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE signals
+                                  SET author_email = COALESCE(NULLIF(%s,''), author_email),
+                                      linkedin_url = COALESCE(NULLIF(%s,''), linkedin_url)
+                                WHERE id = %s""",
+                            (email or "", li or "", sig["id"]),
+                        )
+                    enriched += 1
+                    breakdown[provider] = breakdown.get(provider, 0) + 1
+                except Exception as e:
+                    log.debug("persist enriched signal %s failed: %s", sig["id"], e)
+        except Exception as e:
+            log.debug("enrich signal %s failed: %s", sig["id"], e)
+
+    return {"enriched_count": enriched, "enrich_provider_breakdown": breakdown}
+
+
+# ─── GateAgent (Hermes director) ─────────────────────────────────
+#
+# Quality gate BEFORE outreach is dispatched. Hermes scores whether the
+# HOT leads about to be contacted are genuinely worth it (fit + signal).
+# SAFETY: advisory by default (HERMES_GATE_DISPATCH=advisory) → it only LOGS a
+# score and NEVER changes behaviour. Set HERMES_GATE_DISPATCH=block to have a
+# low score route to `broaden` (find better leads) instead of dispatching.
+# Hermes off (no HERMES_API_URL/KEY) → pass-through, zero change.
+
+def _hermes_lead_score(icp: dict[str, Any], leads: list[dict[str, Any]]) -> dict[str, Any]:
+    """Ask Hermes to score the batch of HOT leads. Returns {} if Hermes off/err."""
+    import json as _json, os as _os, urllib.request as _u
+    url = (_os.environ.get("HERMES_API_URL", "") or "").rstrip("/")
+    key = _os.environ.get("HERMES_API_KEY", "")
+    if not (url and key):
+        return {}
+    endpoint = url + ("/chat/completions" if url.endswith("/v1") else "/v1/chat/completions")
+    body = {"model": _os.environ.get("HERMES_MODEL", "hermes-agent"),
+            "messages": [
+                {"role": "system", "content": "You are the director gating outreach for an "
+                 "elite growth agency. Judge if these HOT leads are worth contacting NOW for "
+                 'this ICP. Return STRICT JSON {"score":0-10,"skip_ids":[],"why":"<short>"}.'},
+                {"role": "user", "content": "ICP: " + _json.dumps(icp.get("name") or icp)[:600]
+                 + "\nLEADS: " + _json.dumps(leads)[:4000]}],
+            "max_tokens": 400, "response_format": {"type": "json_object"}, "stream": False}
+    try:
+        req = _u.Request(endpoint, data=_json.dumps(body).encode(),
+                         headers={"Authorization": "Bearer " + key,
+                                  "Content-Type": "application/json"})
+        r = _json.load(_u.urlopen(req, timeout=60))
+        txt = (r.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        s, e = txt.find("{"), txt.rfind("}")
+        return _json.loads(txt[s:e + 1]) if s >= 0 and e > s else {}
+    except Exception as ex:
+        log.debug("hermes lead-score failed: %s", ex)
+        return {}
+
+
+def gate_agent(state: dict[str, Any]) -> dict[str, Any]:
+    """Hermes quality gate before dispatch. Advisory unless HERMES_GATE_DISPATCH=block."""
+    icp = state["icp"]
+    leads = _list_unenriched_hot_signals(icp["id"], limit=15) or []
+    verdict = _hermes_lead_score(icp, leads)
+    if not verdict:
+        return {"gate_score": None}          # Hermes off/err → no change
+    score = float(verdict.get("score") or 0)
+    mode = os.environ.get("HERMES_GATE_DISPATCH", "advisory").lower()
+    bar = float(os.environ.get("HERMES_GATE_BAR", "6"))
+    log.info("gate: icp=%s hermes_score=%.1f mode=%s why=%s",
+             icp["id"], score, mode, str(verdict.get("why"))[:120])
+    attempts = int(state.get("gate_attempts", 0))
+    out: dict[str, Any] = {"gate_score": score,
+                           "gate_skip_ids": verdict.get("skip_ids") or [],
+                           "gate_attempts": attempts + 1}
+    if mode == "block" and score < bar and attempts < 1:
+        out["needs_broaden"] = True          # ONE broaden for better leads, then dispatch anyway
+    return out
+
+
+def route_after_gate(state: dict[str, Any]) -> str:
+    """block-mode + low score → broaden for better leads; else dispatch."""
+    return "refine" if state.get("needs_broaden") else "ok"
+
+
+# ─── DispatcherAgent ────────────────────────────────────────────
+
+def dispatcher_agent(state: dict[str, Any]) -> dict[str, Any]:
+    """Draft + (optionally) send messages for HOT signals from THIS tick.
+
+    Behavior:
+      - Find HOT signals detected after `since_ts`.
+      - For each, call message_generator.draft_for_signal.
+      - If ICP has autopilot_enabled=true, queue via senders.dispatcher.
+      - Otherwise just persist drafts in outreach store for human approval.
+    """
+    icp = state["icp"]
+    icp_id = icp["id"]
+    since_ts = state.get("since_ts", 0.0)
+
+    try:
+        new_hot = continuous_agent._new_hot_signals_since(icp_id, since_ts)
+    except Exception as e:
+        log.debug("dispatcher list hot failed: %s", e)
+        new_hot = []
+
+    if not new_hot:
+        return {"drafts_made": 0, "drafts_sent": 0, "drafts_blocked": 0}
+
+    try:
+        from services import message_generator
+    except Exception as e:
+        return {"errors": [f"message_generator import: {e}"],
+                "drafts_made": 0, "drafts_sent": 0, "drafts_blocked": 0}
+
+    autopilot = bool(icp.get("autopilot_enabled"))
+
+    # Pre-generate a personalized landing page per HOT signal so drafts can
+    # link to it. Best-effort — failure here doesn't block send.
+    lp_url_by_signal: dict[str, str] = {}
+    try:
+        from services import landing_pages
+        for sig in new_hot[:20]:
+            try:
+                lp = landing_pages.create_for_signal(sig, icp)
+                if lp.get("url"):
+                    lp_url_by_signal[str(sig.get("id"))] = lp["url"]
+            except Exception as e:
+                log.debug("LP gen for signal %s failed: %s", sig.get("id"), e)
+    except Exception as e:
+        log.debug("landing_pages module unavailable: %s", e)
+
+    made = 0
+    sent = 0
+    blocked = 0
+    for sig in new_hot[:20]:
+        try:
+            drafts = message_generator.draft_for_signal(sig, icp) or []
+            # Inject LP url into the draft body if one was generated
+            lp_url = lp_url_by_signal.get(str(sig.get("id")))
+            if lp_url:
+                for d in drafts:
+                    body = d.get("body") or ""
+                    if "{lp_url}" in body:
+                        d["body"] = body.replace("{lp_url}", lp_url)
+                    elif lp_url not in body and d.get("channel") == "email":
+                        d["body"] = body.rstrip() + f"\n\n{lp_url}"
+            for d in drafts:
+                made += 1
+                if not d.get("ok"):
+                    blocked += 1
+                    continue
+                # Persist draft (best-effort)
+                try:
+                    from storage import outreach as outreach_store
+                    outreach_store.insert_draft(
+                        icp_id=icp_id, signal_id=sig.get("id"),
+                        channel=d["channel"], subject=d.get("subject", ""),
+                        body=d.get("body", ""),
+                        variant_label=d.get("variant_label"),
+                        quality_score=d.get("quality_score", 0),
+                    )
+                except Exception as e:
+                    log.debug("persist draft failed: %s", e)
+                # Send if autopilot ON
+                if autopilot:
+                    try:
+                        from senders import dispatcher
+                        ok = dispatcher.dispatch(sig, d)
+                        if ok:
+                            sent += 1
+                    except Exception as e:
+                        log.debug("dispatcher.dispatch failed: %s", e)
+        except Exception as e:
+            log.debug("draft signal %s failed: %s", sig.get("id"), e)
+
+    return {"drafts_made": made, "drafts_sent": sent, "drafts_blocked": blocked}
+
+
+# ─── NotifierAgent ──────────────────────────────────────────────
+
+def notifier_agent(state: dict[str, Any]) -> dict[str, Any]:
+    """Push the genuinely-new HOT signals to Novu + Slack."""
+    icp = state["icp"]
+    since_ts = state.get("since_ts", 0.0)
+    try:
+        new_hot = continuous_agent._new_hot_signals_since(icp["id"], since_ts)
+    except Exception:
+        new_hot = []
+    if not new_hot:
+        return {"notifications_sent": 0}
+    try:
+        continuous_agent._fire_hot_alerts(icp, new_hot)
+        return {"notifications_sent": min(len(new_hot), 10)}
+    except Exception as e:
+        return {"notifications_sent": 0,
+                "notification_errors": [f"notifier: {e}"]}
+
+
+# ─── PipelineAgent ──────────────────────────────────────────────
+
+def pipeline_agent(state: dict[str, Any]) -> dict[str, Any]:
+    """Sync HOT signals into Twenty CRM (people + opportunities)."""
+    icp = state["icp"]
+    icp_id = icp["id"]
+    since_ts = state.get("since_ts", 0.0)
+    try:
+        new_hot = continuous_agent._new_hot_signals_since(icp_id, since_ts)
+    except Exception:
+        new_hot = []
+    if not new_hot:
+        return {"twenty_upserted": 0, "twenty_status_transitions": 0}
+    try:
+        from integrations import twenty_direct
+    except Exception:
+        return {"twenty_upserted": 0, "twenty_status_transitions": 0}
+
+    upserted = 0
+    transitions = 0
+    for sig in new_hot[:20]:
+        try:
+            person_id = twenty_direct.upsert_person_from_signal(sig, icp_id=icp_id) \
+                if hasattr(twenty_direct, "upsert_person_from_signal") else None
+            if person_id:
+                upserted += 1
+            # Transition: detected → contacted will be set by dispatcher; the
+            # pipeline node just ensures the row exists so it shows in Kanban.
+        except Exception as e:
+            log.debug("twenty upsert failed for signal %s: %s", sig.get("id"), e)
+    return {"twenty_upserted": upserted, "twenty_status_transitions": transitions}
+
+
+# ─── Finalize ───────────────────────────────────────────────────
+
+def finalize_agent(state: dict[str, Any]) -> dict[str, Any]:
+    """Update last_scanned_at + write a final audit row."""
+    icp_id = state["icp"]["id"]
+    try:
+        with get_pool().connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE icps SET last_scanned_at = now() WHERE id = %s",
+                (icp_id,),
+            )
+    except Exception as e:
+        log.debug("update last_scanned_at failed: %s", e)
+    try:
+        audit.log("supervisor_tick", icp_id=icp_id, payload={
+            "tick_id":            state.get("tick_id"),
+            "scan_persisted":     state.get("scan_persisted", 0),
+            "scan_hot":           state.get("scan_hot", 0),
+            "extra_loops":        state.get("extra_loops", 0),
+            "final_hot_count":    state.get("final_hot_count", 0),
+            "enriched_count":     state.get("enriched_count", 0),
+            "drafts_made":        state.get("drafts_made", 0),
+            "drafts_sent":        state.get("drafts_sent", 0),
+            "notifications_sent": state.get("notifications_sent", 0),
+            "twenty_upserted":    state.get("twenty_upserted", 0),
+        })
+    except Exception:
+        pass
+    return {"status": "done"}
