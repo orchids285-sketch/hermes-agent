@@ -120,7 +120,9 @@ def quality_gate(crew_outputs: list[dict[str, Any]],
         '{"score": <0-10>, "accept": <bool>, "reason": "<short>", '
         '"redo_tasks": [{"role":"<agent>","instruction":"<precise fix>"}]}. '
         f"accept must be true only if score >= {_BAR}. If below, redo_tasks must "
-        "contain concrete, corrective instructions for the crew.",
+        "contain concrete, corrective instructions for the crew; each instruction MUST "
+        "direct the agent to OUTPUT ONLY the final corrected deliverable — no commentary, "
+        "no meta-discussion, no notes-to-self, just the finished work.",
         f"CREW OUTPUTS:\n{json.dumps(crew_outputs)[:6000]}\n\n"
         f"CRITIC VERDICTS:\n{json.dumps(critiques)[:3000]}",
         max_tokens=900)
