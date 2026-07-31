@@ -1,0 +1,425 @@
+"""LangGraph nodes. Each function takes state and returns a partial state patch.
+
+Self-contained: imports from backend/lib/ (inlined foundrreach modules),
+backend/scrapers/reddit_praw.py and backend/senders/.
+"""
+from __future__ import annotations
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
+
+from config import (
+    APOLLO_API_KEY, PRODUCTHUNT_TOKEN, APIFY_KEY, REDDIT_CLIENT_ID,
+    SCORE_THRESHOLD, MAX_EMAILS_PER_DAY, SENDER_NAME, SENDER_COMPANY,
+)
+from state import CampaignState
+from storage import campaigns as store
+
+from lib import apollo, producthunt, indiehackers, twenty_crm
+from lib.llm import generate_text, generate_json
+from lib.scoring import score_prospect, dedup_prospects
+from scrapers.reddit_praw import fetch as fetch_reddit
+from senders import email_gmail, reddit_dm
+
+
+# ---------------------------------------------------------------- analyze_icp
+
+ICP_SYSTEM = """You analyze a SaaS product description to define its ICP.
+
+Return STRICT JSON:
+{
+  "product_name": "...",
+  "one_liner": "...",
+  "target_personas": ["...","..."],
+  "target_titles": ["Founder","CEO","..."],
+  "target_industries": ["..."],
+  "company_size_range": "1-10",
+  "pain_points": ["...","..."],
+  "value_proposition": "...",
+  "search_keywords": ["...","..."],
+  "reddit_subreddits": ["SaaS","Entrepreneur","..."],
+  "reddit_search_terms": ["...","..."]
+}
+
+Pick 6-10 subreddits where personas hang out. NO 'r/' prefix in the values."""
+
+
+def analyze_icp(state: CampaignState) -> dict[str, Any]:
+    cid = state["campaign_id"]
+    store.push_event(cid, "node_start", {"node": "analyze_icp"})
+    icp = generate_json(ICP_SYSTEM, state["saas_description"], max_tokens=1500)
+    icp["reddit_subreddits"] = [
+        s.replace("r/", "").replace("/r/", "").strip()
+        for s in (icp.get("reddit_subreddits") or [])
+    ]
+    store.push_event(cid, "icp_ready", icp)
+    store.update_campaign(cid, {"icp": icp, "status": "running"})
+    return {"icp": icp, "status": "running"}
+
+
+# ---------------------------------------------------------------- plan_searches
+
+
+def plan_searches(state: CampaignState) -> dict[str, Any]:
+    cid = state["campaign_id"]
+    icp = state["icp"]
+    plan = {
+        "apollo": {
+            "titles": icp.get("target_titles") or ["Founder", "Co-founder", "CEO"],
+            "keywords": " ".join((icp.get("search_keywords") or [])[:5]) or "bootstrapped saas",
+        },
+        "ph": {"extra_topics": []},
+        "ih": {},
+        "reddit": {
+            "subreddits": icp.get("reddit_subreddits") or [],
+            "keywords": icp.get("reddit_search_terms") or icp.get("search_keywords") or [],
+            "pain_hint": (icp.get("pain_points") or [""])[0],
+        },
+    }
+    store.push_event(cid, "plan_ready", plan)
+    return {"search_plan": plan}
+
+
+# ---------------------------------------------------------------- scrapers
+
+
+def search_apollo(state: CampaignState) -> dict[str, Any]:
+    cid = state["campaign_id"]
+    if not APOLLO_API_KEY:
+        store.push_event(cid, "scraper_skipped", {"source": "apollo", "reason": "no key"})
+        return {"prospects": []}
+    plan = state["search_plan"]["apollo"]
+    store.push_event(cid, "scraper_start", {"source": "apollo"})
+    try:
+        rows = apollo.fetch(titles=plan["titles"], keywords=plan["keywords"]) or []
+    except Exception as e:
+        store.push_event(cid, "scraper_error", {"source": "apollo", "error": str(e)})
+        return {"prospects": [], "errors": [f"apollo: {e}"]}
+    store.push_event(cid, "scraper_done", {"source": "apollo", "count": len(rows)})
+    return {"prospects": rows}
+
+
+def search_producthunt(state: CampaignState) -> dict[str, Any]:
+    cid = state["campaign_id"]
+    if not PRODUCTHUNT_TOKEN:
+        store.push_event(cid, "scraper_skipped", {"source": "producthunt", "reason": "no token"})
+        return {"prospects": []}
+    store.push_event(cid, "scraper_start", {"source": "producthunt"})
+    try:
+        rows = producthunt.fetch() or []
+    except Exception as e:
+        store.push_event(cid, "scraper_error", {"source": "producthunt", "error": str(e)})
+        return {"prospects": [], "errors": [f"producthunt: {e}"]}
+    store.push_event(cid, "scraper_done", {"source": "producthunt", "count": len(rows)})
+    return {"prospects": rows}
+
+
+def search_indiehackers(state: CampaignState) -> dict[str, Any]:
+    cid = state["campaign_id"]
+    if not APIFY_KEY:
+        store.push_event(cid, "scraper_skipped", {"source": "indiehackers", "reason": "no apify"})
+        return {"prospects": []}
+    store.push_event(cid, "scraper_start", {"source": "indiehackers"})
+    try:
+        rows = indiehackers.fetch() or []
+    except Exception as e:
+        store.push_event(cid, "scraper_error", {"source": "indiehackers", "error": str(e)})
+        return {"prospects": [], "errors": [f"indiehackers: {e}"]}
+    store.push_event(cid, "scraper_done", {"source": "indiehackers", "count": len(rows)})
+    return {"prospects": rows}
+
+
+def search_reddit(state: CampaignState) -> dict[str, Any]:
+    cid = state["campaign_id"]
+    plan = state.get("search_plan", {}).get("reddit", {})
+    if not REDDIT_CLIENT_ID or not plan.get("subreddits"):
+        store.push_event(cid, "scraper_skipped", {"source": "reddit", "reason": "no creds"})
+        return {"prospects": []}
+    store.push_event(cid, "scraper_start", {"source": "reddit", "subreddits": plan["subreddits"]})
+    try:
+        rows = fetch_reddit(
+            subreddits=plan["subreddits"],
+            keywords=plan.get("keywords", []),
+            icp_pain=plan.get("pain_hint", ""),
+        )
+    except Exception as e:
+        store.push_event(cid, "scraper_error", {"source": "reddit", "error": str(e)})
+        return {"prospects": [], "errors": [f"reddit: {e}"]}
+    store.push_event(cid, "scraper_done", {"source": "reddit", "count": len(rows)})
+    return {"prospects": rows}
+
+
+# ---------------------------------------------------------------- score
+
+
+def score_and_filter(state: CampaignState) -> dict[str, Any]:
+    cid = state["campaign_id"]
+    prospects = state.get("prospects", []) or []
+    store.push_event(cid, "score_start", {"raw_count": len(prospects)})
+
+    email_pool = [p for p in prospects if p.get("source") != "reddit"]
+    reddit_pool = [p for p in prospects if p.get("source") == "reddit"]
+
+    already = store.contacted_emails()
+    deduped_email = dedup_prospects(email_pool, already_contacted=already)
+    for p in deduped_email:
+        p["_score"] = score_prospect(p)
+        p["channel"] = "email"
+    for p in reddit_pool:
+        p["_score"] = score_prospect(p)
+        p["channel"] = "reddit"
+
+    all_scored = deduped_email + reddit_pool
+    qualified = [p for p in all_scored if p["_score"] >= SCORE_THRESHOLD]
+    qualified.sort(key=lambda p: p["_score"], reverse=True)
+
+    store.persist_prospects(cid, qualified)
+    store.update_campaign(cid, {"qualified": qualified})
+    store.push_event(cid, "score_done", {
+        "qualified": len(qualified),
+        "email_targets": sum(1 for p in qualified if p["channel"] == "email"),
+        "reddit_targets": sum(1 for p in qualified if p["channel"] == "reddit"),
+    })
+    return {"qualified": qualified}
+
+
+# ---------------------------------------------------------------- generate (with A/B)
+
+
+EMAIL_SYSTEM = """You write cold B2B emails for SaaS founders.
+
+Hard rules:
+- 5 lines max, body only — no "Hope this finds you well"
+- Start with first name + comma
+- Name the recipient's product + reference one specific pain point
+- Propose ONE concrete solution tied to the sender's product
+- End with a closed (yes/no or A/B) question
+- No links, no signature emoji, no PS
+
+Output format (STRICT):
+SUBJECT: <4-8 words>
+BODY:
+<5 lines max>"""
+
+REDDIT_SYSTEM = """You write Reddit messages from one founder to another.
+
+Hard rules:
+- Reference their specific post
+- Conversational peer-to-peer tone, no sales pitch
+- Mention sender's product ONCE briefly, only if relevant
+- Offer something useful (a tip, a question, a perspective)
+- 3-6 sentences max
+- No promo links, no "check out X" CTAs
+- For public comments: don't say "DMing you"
+
+Output format (STRICT):
+SUBJECT: <subject (DM only, ignored for comments)>
+BODY:
+<message body>"""
+
+VARIANT_HOOKS = {
+    "A": "Hook style: direct & analytical — open with a specific observation about their product/post.",
+    "B": "Hook style: empathetic & question-led — open by acknowledging a common founder struggle.",
+}
+
+
+def _parse_subject_body(text: str) -> tuple[str, str]:
+    subject, body_lines, in_body = "", [], False
+    for line in text.strip().splitlines():
+        if line.upper().startswith("SUBJECT:") and not in_body:
+            subject = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("BODY:"):
+            in_body = True
+        elif in_body:
+            body_lines.append(line)
+    return subject, "\n".join(body_lines).strip()
+
+
+def _user_brief(p: dict[str, Any], variant: str) -> str:
+    parts = [
+        f"first_name: {p.get('first_name') or 'there'}",
+        f"product: {p.get('company_name') or '-'}",
+        f"tagline: {p.get('product_tagline') or '-'}",
+        f"source: {p.get('source')}",
+        f"score: {p.get('_score')}/20",
+        f"variant: {variant}",
+        VARIANT_HOOKS[variant],
+    ]
+    if p.get("channel") == "reddit":
+        parts += [
+            f"reddit_post_title: {p.get('reddit_post_title')}",
+            f"reddit_subreddit: {p.get('reddit_subreddit')}",
+            f"reddit_matched_keyword: {p.get('reddit_matched_keyword')}",
+        ]
+    else:
+        if p.get("mrr") is not None:
+            parts.append(f"mrr: ${p['mrr']}")
+        if p.get("ph_upvotes") is not None:
+            parts.append(f"ph_upvotes: {p['ph_upvotes']}")
+    if SENDER_NAME:
+        parts.append(f"sender_name: {SENDER_NAME}")
+    if SENDER_COMPANY:
+        parts.append(f"sender_company: {SENDER_COMPANY}")
+    return "\n".join(parts)
+
+
+def _generate_for_prospect(p: dict[str, Any]) -> list[dict[str, str]]:
+    """Generate BOTH A and B variants. Returns [{variant, subject, body}, ...]."""
+    system = REDDIT_SYSTEM if p["channel"] == "reddit" else EMAIL_SYSTEM
+    out: list[dict[str, str]] = []
+    for variant in ("A", "B"):
+        text = generate_text(system, _user_brief(p, variant), max_tokens=400)
+        subject, body = _parse_subject_body(text)
+        if body:
+            out.append({"variant": variant, "subject": subject, "body": body})
+    return out
+
+
+def generate_messages(state: CampaignState) -> dict[str, Any]:
+    cid = state["campaign_id"]
+    targets = state.get("qualified", []) or []
+    store.push_event(cid, "generate_start", {"count": len(targets)})
+
+    messages: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        future_to_p = {}
+        for p in targets:
+            key = p.get("email") or f"reddit:{p.get('reddit_username')}"
+            if not key:
+                continue
+            future_to_p[pool.submit(_generate_for_prospect, p)] = (key, p)
+        for fut in as_completed(future_to_p):
+            key, p = future_to_p[fut]
+            try:
+                variants = fut.result()
+                if not variants:
+                    continue
+                store.save_variants(cid, key, variants)
+                # 50/50 random pick — production would track replies and learn.
+                chosen = random.choice(variants)
+                store.mark_variant_chosen(cid, key, chosen["variant"])
+                messages[key] = {**chosen, "channel": p["channel"]}
+            except Exception as e:
+                store.push_event(cid, "generate_error", {"key": key, "error": str(e)})
+
+    store.push_event(cid, "generate_done", {"messages_count": len(messages)})
+    return {"messages": messages}
+
+
+# ------------------------------------------------ Hermes gate (before send)
+
+
+def gate_messages(state: CampaignState) -> dict[str, Any]:
+    """Hermes quality gate on generated messages BEFORE they're sent.
+
+    SAFE: advisory by default (HERMES_GATE_DISPATCH=advisory) — it only records a
+    score and changes nothing. Set HERMES_GATE_DISPATCH=block for ONE regenerate on
+    a low score, then send anyway. Hermes off (no HERMES_API_URL/KEY) => pass-through."""
+    import json as _json, os as _os, urllib.request as _u
+    cid = state["campaign_id"]
+    messages = state.get("messages", {}) or {}
+    url = (_os.environ.get("HERMES_API_URL", "") or "").rstrip("/")
+    key = _os.environ.get("HERMES_API_KEY", "")
+    if not (url and key) or not messages:
+        return {"msg_gate_score": None}
+    sample = [{"subject": m.get("subject"), "body": m.get("body"),
+               "channel": m.get("channel")} for m in list(messages.values())[:8]]
+    endpoint = url + ("/chat/completions" if url.endswith("/v1") else "/v1/chat/completions")
+    payload = {"model": _os.environ.get("HERMES_MODEL", "hermes-agent"),
+               "messages": [
+                   {"role": "system", "content": "You are the director gating cold outreach "
+                    "BEFORE it is sent, for an elite agency. Judge these drafts on "
+                    "personalization, specificity, no-spam, and a clear ask. Return STRICT "
+                    'JSON {"score":0-10,"why":"<short>"}.'},
+                   {"role": "user", "content": _json.dumps(sample)[:4000]}],
+               "max_tokens": 300, "response_format": {"type": "json_object"}, "stream": False}
+    try:
+        req = _u.Request(endpoint, data=_json.dumps(payload).encode(),
+                         headers={"Authorization": "Bearer " + key,
+                                  "Content-Type": "application/json"})
+        r = _json.load(_u.urlopen(req, timeout=60))
+        txt = (r.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        s, e = txt.find("{"), txt.rfind("}")
+        v = _json.loads(txt[s:e + 1]) if s >= 0 and e > s else {}
+    except Exception as ex:
+        store.push_event(cid, "msg_gate_skip", {"error": str(ex)[:160]})
+        return {"msg_gate_score": None}
+    score = float(v.get("score") or 0)
+    mode = _os.environ.get("HERMES_GATE_DISPATCH", "advisory").lower()
+    bar = float(_os.environ.get("HERMES_GATE_BAR", "6"))
+    attempts = int(state.get("msg_gate_attempts", 0))
+    store.push_event(cid, "msg_gate", {"score": score, "mode": mode,
+                                       "why": str(v.get("why"))[:160]})
+    out: dict[str, Any] = {"msg_gate_score": score, "msg_gate_attempts": attempts + 1}
+    if mode == "block" and score < bar and attempts < 1:
+        out["msg_gate_redo"] = True          # regenerate once, then send
+    return out
+
+
+def route_after_message_gate(state: CampaignState) -> str:
+    """block-mode + low score → regenerate once; else send."""
+    return "refine" if state.get("msg_gate_redo") else "ok"
+
+
+# ---------------------------------------------------------------- send
+
+
+def send_all(state: CampaignState) -> dict[str, Any]:
+    cid = state["campaign_id"]
+    targets = state.get("qualified", [])
+    messages = state.get("messages", {}) or {}
+    sent: list[dict[str, Any]] = []
+    errors: list[str] = []
+    email_sent = 0
+
+    for p in targets:
+        score = p.get("_score", 0)
+        key = p.get("email") or f"reddit:{p.get('reddit_username')}"
+        msg = messages.get(key)
+        if not msg:
+            continue
+
+        person_id = None
+        try:
+            person_id = twenty_crm.upsert_person(p, score, status="to_contact")
+            if person_id:
+                twenty_crm.add_context_note(person_id, p, score)
+        except Exception as e:
+            errors.append(f"twenty {key}: {e}")
+
+        if p["channel"] == "email":
+            if email_sent >= MAX_EMAILS_PER_DAY:
+                continue
+            ok, detail = email_gmail.send(p["email"], msg["subject"], msg["body"])
+            if ok:
+                email_sent += 1
+                store.mark_email_contacted(p["email"], score=score, source=p.get("source"),
+                                           subject=msg["subject"])
+                store.mark_prospect_sent(cid, key, msg["variant"])
+                if person_id:
+                    twenty_crm.mark_sent(person_id)
+                sent.append({"key": key, "channel": "email", "variant": msg["variant"]})
+                store.push_event(cid, "sent", {"key": key, "channel": "email",
+                                               "variant": msg["variant"]})
+                time.sleep(2)
+            else:
+                errors.append(f"email {key}: {detail}")
+                store.push_event(cid, "send_error",
+                                 {"key": key, "channel": "email", "detail": detail})
+        else:
+            ok, detail = reddit_dm.send(p, msg["subject"], msg["body"])
+            if ok:
+                store.mark_prospect_sent(cid, key, msg["variant"])
+                sent.append({"key": key, "channel": "reddit", "variant": msg["variant"],
+                             "detail": detail})
+                store.push_event(cid, "sent",
+                                 {"key": key, "channel": "reddit", "variant": msg["variant"]})
+            else:
+                errors.append(f"reddit {key}: {detail}")
+                store.push_event(cid, "send_error",
+                                 {"key": key, "channel": "reddit", "detail": detail})
+
+    store.push_event(cid, "send_done", {"sent": len(sent), "errors": len(errors)})
+    store.update_campaign(cid, {"sent": sent, "errors": errors, "status": "done"})
+    return {"sent": sent, "errors": errors, "status": "done"}

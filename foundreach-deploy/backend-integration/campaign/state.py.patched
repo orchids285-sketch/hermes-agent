@@ -1,0 +1,39 @@
+"""LangGraph state schema for a single FoundReach campaign."""
+from __future__ import annotations
+import operator
+from typing import Annotated, TypedDict, Any
+
+
+class CampaignState(TypedDict, total=False):
+    campaign_id: str
+    saas_description: str
+
+    # Output of analyze_icp
+    icp: dict[str, Any]
+    # Output of plan_searches
+    search_plan: dict[str, Any]
+
+    # Accumulator for prospects from parallel scrapers
+    prospects: Annotated[list[dict[str, Any]], operator.add]
+
+    # After score + dedup
+    qualified: list[dict[str, Any]]
+
+    # email-bound, reddit-bound buckets after channel routing
+    email_targets: list[dict[str, Any]]
+    reddit_targets: list[dict[str, Any]]
+
+    # Generated outreach (keyed by email or reddit username)
+    messages: dict[str, dict[str, Any]]
+
+    # Hermes quality gate on generated messages before send (advisory by default)
+    msg_gate_score: Any
+    msg_gate_attempts: int
+    msg_gate_redo: bool
+
+    # Send results
+    sent: list[dict[str, Any]]
+    errors: Annotated[list[str], operator.add]
+
+    # Stream control
+    status: str  # "pending" | "running" | "done" | "failed"

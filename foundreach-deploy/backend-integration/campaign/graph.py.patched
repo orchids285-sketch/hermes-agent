@@ -1,0 +1,68 @@
+"""LangGraph wiring.
+
+Topology:
+                       ┌─> search_apollo ─┐
+analyze_icp ─> plan ──>├─> search_ph    ─┤─> score_and_filter ─> generate_messages ─> send_all ─> END
+                       ├─> search_ih    ─┤
+                       └─> search_reddit─┘
+
+LangGraph fans the 4 search nodes out automatically and merges the
+`prospects` list via operator.add (declared in state.py).
+"""
+from __future__ import annotations
+from langgraph.graph import StateGraph, END, START
+
+from state import CampaignState
+from .nodes import (
+    analyze_icp,
+    plan_searches,
+    search_apollo,
+    search_producthunt,
+    search_indiehackers,
+    search_reddit,
+    score_and_filter,
+    generate_messages,
+    gate_messages,
+    route_after_message_gate,
+    send_all,
+)
+
+
+def build_graph():
+    g = StateGraph(CampaignState)
+
+    g.add_node("analyze_icp", analyze_icp)
+    g.add_node("plan", plan_searches)
+    g.add_node("apollo", search_apollo)
+    g.add_node("ph", search_producthunt)
+    g.add_node("ih", search_indiehackers)
+    g.add_node("reddit", search_reddit)
+    g.add_node("score", score_and_filter)
+    g.add_node("generate", generate_messages)
+    g.add_node("gate", gate_messages)        # ← Hermes quality gate before send (advisory by default)
+    g.add_node("send", send_all)
+
+    g.add_edge(START, "analyze_icp")
+    g.add_edge("analyze_icp", "plan")
+    for branch in ("apollo", "ph", "ih", "reddit"):
+        g.add_edge("plan", branch)
+        g.add_edge(branch, "score")
+    g.add_edge("score", "generate")
+    g.add_edge("generate", "gate")
+    g.add_conditional_edges("gate", route_after_message_gate, {
+        "refine": "generate",   # block-mode + low score → regenerate once
+        "ok":     "send",
+    })
+    g.add_edge("send", END)
+
+    return g.compile()
+
+
+_compiled = None
+
+
+def get_graph():
+    global _compiled
+    if _compiled is None:
+        _compiled = build_graph()
+    return _compiled

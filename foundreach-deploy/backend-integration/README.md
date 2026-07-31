@@ -43,3 +43,16 @@ Files: supervisor.py.patched + supervisor_nodes.py.patched.
 - ▫ `backend/main.py:2903` graph, `services/mission_runner.py`, `services/agent_graph.py`,
    `services/autopilot_engine.py` (computer-use) — same `HermesBrain`/gate pattern applies;
    wire as needed once the two main loops are validated live.
+
+## 3rd orchestrator fixed — the CAMPAIGN graph (backend/orchestrator/graph.py)
+Flow: analyze_icp → plan → searches → score → generate(messages) → **send**. No gate
+between generate and send → messages were sent ungated. Added `gate_messages` (Hermes):
+`generate → gate → {refine→generate | ok→send}`. **SAFE: advisory by default**
+(`HERMES_GATE_DISPATCH=advisory`, logs a score, changes nothing); `=block` regenerates once
+on a low score. Files under `campaign/`: graph.py.patched, nodes.py.patched, state.py.patched.
+
+## FINAL coverage — 3 core result-loops GATED
+- ✅ brain (content) — enforced redo · ✅ supervisor (outreach) — advisory · ✅ campaign (outreach) — advisory
+- ▫ mission_runner — already send-safe (drafts stay drafts, approval-gated, compliance_guard); add a quality hook on request
+- ▫ agent_graph.py, autopilot_engine (computer-use) — secondary / different modality; wire on request
+All gates: Hermes off => pass-through (zero behaviour change). Activate with HERMES_API_URL + HERMES_API_KEY.
