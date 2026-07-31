@@ -35,8 +35,11 @@ class AgentState(TypedDict, total=False):
     raw_signals: Annotated[list[dict[str, Any]], operator.add]
     # Tâches générées par BabyAGI
     tasks: list[dict[str, Any]]
-    # Résultats produits par CrewAI
+    # Résultats produits par CrewAI (accumulés sur tout le run — pour la mémoire)
     crew_outputs: Annotated[list[dict[str, Any]], operator.add]
+    # Dernier lot d'outputs (NON accumulé) — c'est CE que le gate juge (l'essai courant,
+    # pas l'historique) sinon une vieille sortie faible fait échouer chaque reprise.
+    last_outputs: list[dict[str, Any]]
     # Verdicts du critique (AutoGen)
     critiques: Annotated[list[dict[str, Any]], operator.add]
     # Doit-on continuer la boucle ?
@@ -109,7 +112,7 @@ def delegate(state: AgentState) -> dict[str, Any]:
         logger.info("[brain] delegate — REPRISE ({} tâches correctives)", len(redo))
     outputs = run_crew(tasks=tasks, signals=state.get("raw_signals", []))
     logger.info("[brain] delegate — {} outputs du crew", len(outputs))
-    out: dict[str, Any] = {"crew_outputs": outputs}
+    out: dict[str, Any] = {"crew_outputs": outputs, "last_outputs": outputs}
     if redo:
         out["redo_count"] = int(state.get("redo_count", 0)) + 1
         out["redo_tasks"] = []          # consommées
@@ -133,7 +136,8 @@ def gate(state: AgentState) -> dict[str, Any]:
     from ultimate_agent.core import hermes_director
 
     v = hermes_director.quality_gate(
-        state.get("crew_outputs", []), state.get("critiques", []),
+        state.get("last_outputs") or state.get("crew_outputs", []),
+        state.get("critiques", []),
         redo_count=int(state.get("redo_count", 0)))
     logger.info("[brain] gate — score={} accept={} ({})",
                 v.get("score"), v.get("accept"), v.get("reason"))

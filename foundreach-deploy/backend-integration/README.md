@@ -56,3 +56,11 @@ on a low score. Files under `campaign/`: graph.py.patched, nodes.py.patched, sta
 - ▫ mission_runner — already send-safe (drafts stay drafts, approval-gated, compliance_guard); add a quality hook on request
 - ▫ agent_graph.py, autopilot_engine (computer-use) — secondary / different modality; wire on request
 All gates: Hermes off => pass-through (zero behaviour change). Activate with HERMES_API_URL + HERMES_API_KEY.
+
+## BUGFIX found via a LIVE real-engine run (2026-08-01)
+Running the REAL brain.py graph against live Hermes revealed the `gate` judged the
+ACCUMULATED `crew_outputs` (operator.add) — so a stale weak output failed every retry
+→ it hit the redo cap instead of accepting good work. FIX: added a non-accumulating
+`last_outputs` field; delegate sets it; the gate judges `last_outputs` (the current
+attempt). Re-verified live: reject 3/10 → redo → **accept 8/10** → memorize → decide
+(clean convergence, one redo). This is why you run it for real. (brain.py.patched updated.)
