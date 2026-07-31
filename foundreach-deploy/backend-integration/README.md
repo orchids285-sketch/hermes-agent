@@ -64,3 +64,13 @@ ACCUMULATED `crew_outputs` (operator.add) — so a stale weak output failed ever
 `last_outputs` field; delegate sets it; the gate judges `last_outputs` (the current
 attempt). Re-verified live: reject 3/10 → redo → **accept 8/10** → memorize → decide
 (clean convergence, one redo). This is why you run it for real. (brain.py.patched updated.)
+
+## 4th orchestrator wired — mission_runner (autonomous employee)
+`backend/services/mission_runner.py` runs plan→act→observe→decide over real organs
+(hunt/draft_openers/draft_followups/do_action/operate/browse/finish). Added
+`_hermes_refine_step` in `_decide`: Hermes reviews the next-step pick and may choose a
+BETTER tool (builds a valid step via the organ→param map). **OPT-IN: default OFF**
+(`HERMES_DIRECT_MISSION=1` to enable), graceful (any failure = original pick), and
+compliance + approval-gated sends downstream are untouched. Proven live: a premature
+`finish` was redirected to `hunt("fintech founder reddit")`. File: mission/mission_runner.py.patched.
+(Primary mission path = services/agent_graph.py tool-calling agent; wire on request.)

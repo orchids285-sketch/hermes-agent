@@ -1,0 +1,302 @@
+"""services/mission_runner.py — the autonomous employee brain.
+
+One mission in ("find my best SaaS leads on reddit, write to them and book
+calls"), and the runner LOOPS — plan → act → observe → decide next — across the
+REAL organs of the product until the mission is done. It never asks the user a
+question mid-mission: it decides, acts, and reports. This is the "ghost that
+runs the whole computer" the product promises, server-side so nothing in the UI
+can stop it (tab switches, closed panels, slow networks).
+
+Organs it can drive (all in-process, no HTTP hop):
+  hunt            → the agent pipeline (15-source open-web buyer hunt → CRM)
+  draft_openers   → autopilot personalized first-touches (hottest leads first)
+  draft_followups → autopilot multi-touch bumps for non-repliers
+  do_action       → actions.plan_and_run (book / remind / alert / CRM update)
+  operate         → operator_executor (execute inside a connected tool)
+  finish          → wrap up with an honest summary
+
+Safety: drafting stays drafting (approval-gated sends remain the product rule);
+compliance_guard still gates every automated send downstream. Max-step bounded.
+Every step yields an event dict so the frontend ghost can narrate live.
+"""
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Generator
+
+from lib.logger import get_logger
+
+log = get_logger()
+
+MAX_STEPS = 8
+
+_TOOLS_DOC = (
+    '{"tool":"hunt","query":"<who to find, where>"} — search the open web (reddit/linkedin/HN/…) for buyers; results are auto-captured to the CRM\n'
+    '{"tool":"draft_openers","goal":"<the offer>"} — write a personalized first message for the hottest uncontacted leads\n'
+    '{"tool":"draft_followups","goal":"<the offer>"} — write follow-ups for contacts who never replied\n'
+    '{"tool":"do_action","instruction":"<book a meeting with X / remind me Y / alert me when Z / update CRM …>"} — execute a concrete action\n'
+    '{"tool":"operate","instruction":"<do X in tool Y>"} — act inside a connected tool (CRM/social/docs/…)\n'
+    '{"tool":"browse","task":"<a task needing a real browser: scrape a specific site, fill a form, check a page>"} — drive a REAL browser (OpenInterpreter/Agent-S style)\n'
+    '{"tool":"finish","summary":"<what got done, honestly>"} — end the mission'
+)
+
+_PLAN_SYS = (
+    "You are the autonomous brain of a B2B growth employee. You are given a MISSION "
+    "and the results of the steps taken so far. Decide the ONE next step.\n"
+    f"Available tools:\n{_TOOLS_DOC}\n"
+    "Rules:\n"
+    "- NEVER ask the user anything. Decide yourself, with sensible defaults.\n"
+    "- A hunt already captures results to the CRM — don't 'add to CRM' after it.\n"
+    "- After a hunt that found people, draft_openers is almost always the right next step.\n"
+    "- finish as soon as the mission is genuinely covered; do not invent extra work.\n"
+    'Return JSON only: {"say":"<8-14 word narration of what you are doing>","step":{...one tool call...}}'
+)
+
+
+def _is_hunt(mission: str) -> bool:
+    return bool(re.search(
+        r"\b(find|trouve[sz]?|cherche[rz]?|search|scrape|hunt|identifie|leads?|buyers?|prospects?|acheteurs?)\b",
+        mission, re.I))
+
+
+def _exec(user_id: str, step: dict[str, Any]) -> dict[str, Any]:
+    """Run one organ call; always returns an observation dict, never raises."""
+    tool = (step.get("tool") or "").strip()
+    try:
+        if tool == "hunt":
+            from routers.agent import AgentRun, run as agent_run
+            r = agent_run(AgentRun(user_id=user_id, prompt=str(step.get("query") or "")[:400]))
+            n = len(r.get("results") or [])
+            return {"tool": tool, "ok": bool(r.get("ok")), "found": n,
+                    "summary": r.get("summary") or f"{n} signals found",
+                    "tab": "chat"}
+        if tool == "draft_openers":
+            from services import autopilot
+            r = autopilot.generate(user_id, str(step.get("goal") or "")[:300], limit=8)
+            return {"tool": tool, "ok": bool(r.get("ok")), "drafted": int(r.get("drafted") or 0),
+                    "summary": f"{r.get('drafted') or 0} opener(s) drafted",
+                    "note": r.get("note"), "tab": "automations"}
+        if tool == "draft_followups":
+            from services import autopilot
+            r = autopilot.draft_followups(user_id, str(step.get("goal") or "")[:300], limit=6)
+            return {"tool": tool, "ok": bool(r.get("ok")), "drafted": int(r.get("drafted") or 0),
+                    "summary": f"{r.get('drafted') or 0} follow-up(s) drafted", "tab": "automations"}
+        if tool == "do_action":
+            from services import actions
+            r = actions.plan_and_run(user_id, str(step.get("instruction") or "")[:300])
+            return {"tool": tool, "ok": bool(r.get("ok", True)),
+                    "summary": (r.get("summary") or "action executed")[:200], "tab": "home"}
+        if tool == "operate":
+            from lib import operator_executor as oe
+            acts = oe.execute(user_id, str(step.get("instruction") or "")[:300], "") or []
+            return {"tool": tool, "ok": bool(acts),
+                    "summary": (oe.summarize(acts) if acts
+                                else "No direct tool action was needed for that step.")[:200],
+                    "tab": "home"}
+        if tool == "browse":
+            # Drive a REAL browser (OpenInterpreter/Agent-S style) for tasks the
+            # in-process organs can't do. Start it, then wait up to ~90s for a
+            # terminal result — narrating that it's running if it takes longer.
+            import time as _t
+            from routers import browser_agent as ba
+            r = ba.start_run(user_id, str(step.get("task") or "")[:400], max_steps=18)
+            if not r.get("ok"):
+                return {"tool": tool, "ok": False,
+                        "summary": f"browser unavailable ({r.get('error', 'not configured')}) — I'll do it another way",
+                        "tab": "liveagent"}
+            rid = r["run_id"]
+            for _ in range(30):  # ~90s
+                _t.sleep(3)
+                st = ba.run_status(rid)
+                if st.get("status") in ("done", "error"):
+                    ok = st.get("status") == "done"
+                    return {"tool": tool, "ok": ok, "run_id": rid,
+                            "summary": (st.get("result") or st.get("error") or "browser run finished")[:220],
+                            "tab": "liveagent"}
+            return {"tool": tool, "ok": True, "run_id": rid,
+                    "summary": "Browser is still working — watch it in the Live Agent; I'll keep going.",
+                    "tab": "liveagent"}
+    except Exception as e:  # noqa: BLE001 — one organ failure must not kill the mission
+        log.info("mission organ %s failed: %s", tool, str(e)[:120])
+        return {"tool": tool, "ok": False, "summary": f"{tool} hit a snag: {str(e)[:90]}"}
+    return {"tool": tool, "ok": False, "summary": f"unknown tool {tool!r}"}
+
+
+# organ → the step param it reads (from _exec above), so a Hermes override builds a valid step
+_TOOL_PARAM = {"hunt": "query", "draft_openers": "goal", "draft_followups": "goal",
+               "do_action": "instruction", "operate": "instruction", "browse": "task",
+               "finish": "summary"}
+
+
+def _hermes_refine_step(mission: str, history: list[dict[str, Any]],
+                        chosen: dict[str, Any]) -> dict[str, Any]:
+    """OPT-IN director: let Hermes (memory + reasoning) review the picked next step and,
+    if it has a clearly better one, override it — but ONLY with a VALID tool, and it never
+    invents params (uses Hermes' arg, else the previous step's param, else the mission).
+
+    Default OFF (HERMES_DIRECT_MISSION unset) and ANY failure returns `chosen` unchanged, so
+    on this live-action path Hermes can never destabilize a mission. Compliance + approval-gated
+    sends downstream still apply regardless of which tool runs."""
+    import os as _os
+    if _os.environ.get("HERMES_DIRECT_MISSION", "0") not in ("1", "true", "yes"):
+        return chosen
+    url = (_os.environ.get("HERMES_API_URL", "") or "").rstrip("/")
+    k = _os.environ.get("HERMES_API_KEY", "")
+    if not (url and k):
+        return chosen
+    import urllib.request as _u
+    ep = url + ("/chat/completions" if url.endswith("/v1") else "/v1/chat/completions")
+    body = {"model": _os.environ.get("HERMES_MODEL", "hermes-agent"), "messages": [
+        {"role": "system", "content": "You direct an autonomous sales employee toward top "
+         "results, using your memory of what works. Given the mission, the steps so far, and the "
+         "PROPOSED next step, return the BEST next step. Tools: " + ", ".join(_TOOL_PARAM) +
+         '. Return STRICT JSON {"tool":"<one>","arg":"<query/goal/instruction text>","say":"<short>"}.'},
+        {"role": "user", "content": "MISSION: " + mission + "\nHISTORY: "
+         + json.dumps(history)[:1500] + "\nPROPOSED: " + json.dumps(chosen)[:400]}],
+        "max_tokens": 220, "response_format": {"type": "json_object"}, "stream": False}
+    try:
+        req = _u.Request(ep, data=json.dumps(body).encode(),
+                         headers={"Authorization": "Bearer " + k, "Content-Type": "application/json"})
+        r = json.load(_u.urlopen(req, timeout=45))
+        txt = (r.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        s, e = txt.find("{"), txt.rfind("}")
+        v = json.loads(txt[s:e + 1]) if s >= 0 and e > s else {}
+        tool = v.get("tool")
+        if tool in _TOOL_PARAM:
+            param = _TOOL_PARAM[tool]
+            arg = str(v.get("arg") or (chosen.get("step") or {}).get(param) or mission)[:400]
+            log.info("mission: Hermes directed next step → %s", tool)
+            return {"say": str(v.get("say") or chosen.get("say") or "Working…")[:140],
+                    "step": {"tool": tool, param: arg}}
+    except Exception as ex:  # noqa: BLE001 — director must never break the mission
+        log.info("hermes mission-direct skipped: %s", str(ex)[:100])
+    return chosen
+
+
+def _decide(mission: str, history: list[dict[str, Any]], user_id: str) -> dict[str, Any]:
+    """LLM picks the next step; deterministic seed/fallbacks keep it moving.
+    When HERMES_DIRECT_MISSION=1, Hermes reviews the pick and may choose a better one."""
+    # Step 1 on a hunt-style mission is deterministic — no LLM roulette.
+    if not history and _is_hunt(mission):
+        return {"say": "Hunting the open web for your buyers now.",
+                "step": {"tool": "hunt", "query": mission[:300]}}
+    try:
+        from lib import llm as llm_lib
+        from lib.client_profile import context_block
+        ctx = (context_block(user_id) or "")[:700]
+        out = llm_lib.generate_json(
+            _PLAN_SYS,
+            f"MISSION: {mission}\n\nSTEPS SO FAR:\n"
+            + (json.dumps(history, ensure_ascii=False)[:1800] if history else "(none)")
+            + (f"\n\nBUSINESS CONTEXT:\n{ctx}" if ctx else ""),
+            max_tokens=300, temperature=0.2)
+        if isinstance(out, dict) and isinstance(out.get("step"), dict) and out["step"].get("tool"):
+            return _hermes_refine_step(mission, history,
+                {"say": str(out.get("say") or "Working…")[:140], "step": out["step"]})
+    except Exception as e:
+        log.info("mission decide fallback: %s", str(e)[:100])
+    # Fallback ladder: hunt → openers → finish.
+    done = {h.get("tool") for h in history}
+    if "hunt" in done and "draft_openers" not in done:
+        return {"say": "Writing personalized openers for what I found.",
+                "step": {"tool": "draft_openers", "goal": mission[:300]}}
+    return {"say": "Wrapping up.",
+            "step": {"tool": "finish",
+                     "summary": "Mission covered: " + "; ".join(
+                         h.get("summary", "") for h in history)[:300]}}
+
+
+def run_mission(user_id: str, mission: str,
+                max_steps: int = MAX_STEPS) -> Generator[dict[str, Any], None, None]:
+    """The mission loop. Yields events: {type:'step'|'observe'|'done', ...}.
+
+    Prefers the LangGraph tool-calling agent (services.agent_graph) — the real
+    "employee that controls everything", running native function-calling on
+    Claude Opus 4.8 (OpenRouter) with a Groq fallback. If LangGraph / the
+    tool-calling model is unavailable OR errors out before yielding any step, it
+    falls back to the hand-rolled loop below so a mission NEVER dead-ends."""
+    # Intent guard: decline ban-evasion mass social automation before doing
+    # ANY work (send-path guard is downstream; this keeps the agent honest too).
+    try:
+        from lib import compliance_guard
+        ok, refusal = compliance_guard.assess_intent(mission)
+        if not ok:
+            yield {"type": "step", "n": 0, "say": "Checking this stays compliant…"}
+            yield {"type": "done", "summary": refusal, "ok": True, "compliance": True}
+            return
+    except Exception as e:  # noqa: BLE001
+        log.info("intent guard skipped: %s", str(e)[:100])
+    try:
+        from services import agent_graph
+        if agent_graph.is_available():
+            emitted = False
+            try:
+                for ev in agent_graph.run(user_id, mission, max_steps=max_steps):
+                    emitted = True
+                    yield ev
+                return
+            except Exception as e:  # noqa: BLE001
+                log.info("agent_graph failed (%s) — %s", str(e)[:120],
+                         "already streamed, stopping" if emitted else "falling back to legacy loop")
+                if emitted:
+                    yield {"type": "done", "summary": "Handing off — I'll pick this up on the next cycle."}
+                    return
+                # else: fall through to the legacy loop, nothing shown yet.
+    except Exception as e:  # noqa: BLE001
+        log.info("agent_graph unavailable: %s", str(e)[:120])
+
+    yield from _run_mission_legacy(user_id, mission, max_steps)
+
+
+def _run_mission_legacy(user_id: str, mission: str,
+                        max_steps: int = MAX_STEPS) -> Generator[dict[str, Any], None, None]:
+    """The original hand-rolled plan→act→observe loop. Kept as a resilient
+    fallback for when the LangGraph agent can't run (no tool-calling key, deps
+    missing, or a setup error)."""
+    history: list[dict[str, Any]] = []
+    for n in range(1, max_steps + 1):
+        try:
+            d = _decide(mission, history, user_id)
+        except Exception as e:  # noqa: BLE001
+            yield {"type": "done", "summary": f"Stopped early: {str(e)[:100]}"}
+            return
+        step = d.get("step") or {}
+        if (step.get("tool") or "") == "finish":
+            yield {"type": "done",
+                   "summary": str(step.get("summary") or "Done.")[:400],
+                   "steps": len(history)}
+            return
+        yield {"type": "step", "n": n, "say": d.get("say") or "Working…",
+               "tool": step.get("tool")}
+        obs = _exec(user_id, step)
+        history.append(obs)
+        yield {"type": "observe", "n": n, "ok": obs.get("ok"),
+               "summary": obs.get("summary"), "tab": obs.get("tab")}
+        # Two consecutive failures → stop honestly instead of thrashing.
+        if len(history) >= 2 and not history[-1].get("ok") and not history[-2].get("ok"):
+            landed = _wins(history)
+            yield {"type": "done",
+                   "summary": ("I hit two snags in a row — here's what did land: " + landed)
+                              if landed else
+                              "I ran into two snags in a row and couldn't complete this — I'll retry on the next cycle."}
+            return
+    landed = _wins(history)
+    yield {"type": "done",
+           "summary": ("Here's what I got done: " + landed) if landed else
+                      ("I ran the search but found nothing that matches this specific ask "
+                       "right now — tell me to broaden it and I'll go again."),
+           "steps": len(history)}
+
+
+def _wins(history: list[dict[str, Any]]) -> str:
+    """Roll up the observations that actually moved the mission forward — skip
+    no-op / failed organ returns so the final summary is honest, never a bare
+    'no action needed' tail."""
+    good: list[str] = []
+    for h in history:
+        s = str(h.get("summary") or "").strip()
+        low = s.lower()
+        if h.get("ok") and s and "no direct tool action" not in low and "no action" not in low:
+            good.append(s[:140])
+    return "; ".join(good[-4:])[:400]
