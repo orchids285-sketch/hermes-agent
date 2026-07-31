@@ -87,3 +87,17 @@ File: mission/agent_graph.py.patched.
 brain (enforced gate) · supervisor + campaign (advisory gates) · mission_runner (_decide director) ·
 agent_graph (strategy injection). Remaining: computer-use (autopilot_engine, Agent-S/OI) — needs a
 DIFFERENT gate (verify a GUI action ≠ score text); wire on request. All graceful: Hermes off => unchanged.
+
+## 6th orchestrator wired — computer-use (autopilot_engine, Agent-S/OI on the E2B desktop)
+The in-sandbox action loop (`_AP_RUNNER`) does `agent.predict()` → `exec(act)` (pyautogui on the
+live desktop). Added `_hermes_ok(task, thought, act)` BEFORE the exec: Hermes verifies each GUI
+action. ADVISORY by default (`HERMES_GATE_ACTIONS=advisory`, logs a verdict, always executes);
+`=block` lets Hermes VETO destructive/off-task actions (the action is skipped). `HERMES_*` passed
+through run_gui's env. Proven live: safe click → ok:true; `shutil.rmtree('/home')` → ok:false.
+File: computer-use/autopilot_engine.py.patched.
+
+## ✅ COVERAGE COMPLETE — all 6 orchestrators Hermes-directed
+1. brain (content) — enforced gate  2. supervisor (outreach) — advisory  3. campaign (outreach) — advisory
+4. mission_runner (_decide director)  5. agent_graph (strategy injection)  6. computer-use (action gate)
+Every one is GRACEFUL: with HERMES_API_URL/HERMES_API_KEY unset, behaviour is identical to before.
+Activate all at once by setting those two env vars on the backend (+ optional HERMES_GATE_* / HERMES_DIRECT_MISSION).

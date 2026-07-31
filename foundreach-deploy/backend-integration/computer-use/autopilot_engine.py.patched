@@ -1,0 +1,547 @@
+"""services/autopilot_engine.py — the BEST full-SaaS autopilot: it drives the
+live E2B desktop with BOTH open-source computer-use tools working together.
+
+  • Agent-S (Simular AI, `gui_agents`)  — the GUI brain. Its manager decomposes
+    the goal, its worker grounds each step against the current screenshot and
+    emits a concrete pyautogui action. We run that action on the SAME E2B desktop
+    the user is watching (pyautogui executed on the sandbox display).
+  • OpenInterpreter (`interpreter`)     — the CODE brain. When a step is better
+    done as code (install a CLI, parse a file, hit an API, transform data), OI's
+    write→run→observe→correct loop executes it — on the very desktop on screen.
+
+The two are complementary: Agent-S for pixels/UI, OpenInterpreter for the
+"just run code on the machine" power. This module orchestrates them into one
+autopilot and STREAMS every step (thought + action + screenshot) to the caller.
+
+Safety / resilience: everything is behind lazy, guarded imports. If either lib
+isn't installed (they're heavy — see requirements notes), `is_available()`
+returns False and services.computer_agent falls back to its built-in vision
+loop, so the autopilot NEVER hard-fails. `run()` yields the same event shape as
+computer_agent so the Computer tab renders it unchanged.
+"""
+from __future__ import annotations
+
+import base64
+import os
+import re
+import time
+from typing import Any, Callable
+
+from lib.logger import get_logger
+
+log = get_logger()
+
+# The heavy autopilot tools (gui-agents / open-interpreter) are installed into an
+# ISOLATED dir (`pip install --target=/opt/ap-libs …` in the Dockerfile) so their
+# transitive deps never perturb the main app's pinned environment. Add it to the
+# import path lazily; if the dir/libs are absent, the guarded imports below just
+# report unavailable and callers fall back to the built-in loop.
+import sys as _sys
+_AP_LIBS = os.environ.get("AUTOPILOT_LIBS_DIR", "/opt/ap-libs")
+if os.path.isdir(_AP_LIBS) and _AP_LIBS not in _sys.path:
+    _sys.path.append(_AP_LIBS)
+
+_HARD_BUDGET_S = 600
+_MAX_STEPS_CAP = 40
+
+# Reuse the app's LLM keys / models. Agent-S + OpenInterpreter both speak the
+# OpenAI-compatible OpenRouter endpoint, so one key powers planning + code, and a
+# vision model powers grounding — no extra provider to configure.
+_OR_KEY = lambda: os.environ.get("OPENROUTER_API_KEY")  # noqa: E731
+_PLAN_MODEL = lambda: os.environ.get("AUTOPILOT_PLAN_MODEL", "anthropic/claude-sonnet-4.6")  # noqa: E731
+_GROUND_MODEL = lambda: os.environ.get("AUTOPILOT_GROUND_MODEL", "openai/gpt-4o")  # noqa: E731
+_CODE_MODEL = lambda: os.environ.get("AUTOPILOT_CODE_MODEL", "openrouter/anthropic/claude-sonnet-4.6")  # noqa: E731
+
+
+# ─────────────────────────── availability ───────────────────────────
+
+def _import_agent_s():
+    """Return (GraphSearchAgent, LinuxACI) across Agent-S layouts (S1-flat
+    `gui_agents.core.AgentS` / `aci.LinuxOSACI` is what the current pip ships;
+    S2 `gui_agents.s2.*` is the fallback). Raises if none import."""
+    try:
+        from gui_agents.core.AgentS import GraphSearchAgent as A
+        from gui_agents.aci.LinuxOSACI import LinuxACI as C
+        return A, C
+    except Exception:
+        from gui_agents.s2.agents.agent_s import AgentS2 as A  # type: ignore
+        from gui_agents.s2.agents.grounding import OSWorldACI as C  # type: ignore
+        return A, C
+
+
+def gui_available() -> bool:
+    """The Agent-S GUI engine is provisionable.
+
+    Agent-S's Linux ACI hard-imports `pyatspi` (AT-SPI) and drives a LOCAL
+    pyautogui display, so it CANNOT run in the headless backend — it must run
+    INSIDE the E2B desktop it controls (which has the X display + can apt-install
+    AT-SPI). run_gui() bootstraps the real `gui-agents` package into the sandbox
+    on first use. So availability here = "we have the OpenRouter key that powers
+    its planner+grounder"; the package itself is provisioned per-sandbox at run
+    time. Falls back to the built-in vision loop if the in-sandbox bootstrap
+    fails, so this is never a hard dependency."""
+    return bool(_OR_KEY()) and os.environ.get("AUTOPILOT_AGENT_S", "1") not in ("0", "false", "")
+
+
+def code_available() -> bool:
+    """OpenInterpreter installed + a key present."""
+    if not (_OR_KEY() or os.environ.get("ANTHROPIC_API_KEY")):
+        return False
+    try:
+        import interpreter  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def is_available() -> bool:
+    """True when AT LEAST ONE real tool can run (the other degrades to the
+    built-in loop for that step type)."""
+    return gui_available() or code_available()
+
+
+def engines() -> dict[str, bool]:
+    return {"agent_s": gui_available(), "open_interpreter": code_available()}
+
+
+def diagnostics(src: bool = False) -> dict[str, Any]:
+    """Why is an engine (un)available? Reports the isolated-libs dir + the exact
+    import outcome for each tool (so a false in engines() is explainable).
+    src=True also dumps the installed package's canonical run loop / API sigs."""
+    d: dict[str, Any] = {"ap_libs_dir": _AP_LIBS,
+                         "ap_libs_exists": os.path.isdir(_AP_LIBS),
+                         "openrouter_key": bool(_OR_KEY()),
+                         # Where each engine actually runs:
+                         "agent_s_runs": "in-sandbox (Agent-S needs the desktop's "
+                                         "AT-SPI/pyautogui; provisioned per-sandbox at run time)",
+                         "open_interpreter_runs": "backend (executes on the desktop via shell)",
+                         "gui_available": gui_available(),
+                         "code_available": code_available()}
+    try:
+        d["ap_libs_sample"] = (sorted(os.listdir(_AP_LIBS))[:25]
+                               if os.path.isdir(_AP_LIBS) else [])
+    except Exception as e:  # noqa: BLE001
+        d["ap_libs_err"] = str(e)[:120]
+    # Backend import of Agent-S is EXPECTED to fail (pyatspi is desktop-only); the
+    # real one runs inside the sandbox. This line documents that, it is not a bug.
+    try:
+        _import_agent_s()
+        d["gui_agents_backend_import"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        d["gui_agents_backend_import"] = (f"expected-fail ({type(e).__name__}: "
+                                          f"{str(e)[:120]}) — Agent-S runs in-sandbox")
+    try:
+        __import__("interpreter")
+        d["interpreter"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        d["interpreter"] = f"{type(e).__name__}: {str(e)[:200]}"
+    # Reveal the ACTUAL gui_agents .py files in core/ + aci/ so we target the
+    # right submodule, and the real import error for the primary path.
+    try:
+        import gui_agents as _ga
+        p = list(getattr(_ga, "__path__", []))[0]
+        d["gui_agents_ver"] = getattr(_ga, "__version__", "?")
+        for sub in ("core", "aci"):
+            try:
+                d[f"gui_agents_{sub}"] = sorted(
+                    x[:-3] for x in os.listdir(os.path.join(p, sub))
+                    if x.endswith(".py") and not x.startswith("_"))[:25]
+            except Exception as e:  # noqa: BLE001
+                d[f"gui_agents_{sub}"] = f"ERR {str(e)[:80]}"
+    except Exception as e:  # noqa: BLE001
+        d["gui_agents_top"] = f"{type(e).__name__}: {str(e)[:120]}"
+    try:
+        from gui_agents.core.AgentS import GraphSearchAgent  # noqa: F401
+        d["core_AgentS"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        d["core_AgentS"] = f"{type(e).__name__}: {str(e)[:160]}"
+    # The ACI is the desktop-binding half — likely the real blocker (pyautogui /
+    # python-xlib / AT-SPI unavailable headless). Capture its exact error + classes.
+    try:
+        import inspect
+        import gui_agents.aci.LinuxOSACI as _lin
+        d["aci_LinuxOSACI"] = "ok"
+        d["aci_classes"] = [n for n, o in inspect.getmembers(_lin, inspect.isclass)
+                            if getattr(o, "__module__", "") == _lin.__name__]
+    except Exception as e:  # noqa: BLE001
+        d["aci_LinuxOSACI"] = f"{type(e).__name__}: {str(e)[:200]}"
+    # Canonical run loop + APIs so we can write a FAITHFUL in-sandbox runner
+    # (Agent-S runs where the display + AT-SPI live, i.e. inside the sandbox).
+    if src:
+        import inspect
+        try:
+            import gui_agents.cli_app as _cli
+            d["cli_source"] = inspect.getsource(_cli)[:9000]
+        except Exception as e:  # noqa: BLE001
+            d["cli_source"] = f"{type(e).__name__}: {str(e)[:160]}"
+        try:
+            from gui_agents.core.AgentS import GraphSearchAgent as _G
+            d["agent_init_sig"] = str(inspect.signature(_G.__init__))
+            d["agent_predict_sig"] = str(inspect.signature(_G.predict))
+        except Exception as e:  # noqa: BLE001
+            d["agent_sig"] = f"{type(e).__name__}: {str(e)[:160]}"
+    return d
+
+
+# ─────────────────────── Agent-S GUI engine (IN-SANDBOX) ───────────────────────
+# Agent-S is designed to run ON the machine it controls: its Linux ACI hard-imports
+# `pyatspi` (AT-SPI accessibility) and executes local `pyautogui`. That's impossible
+# in the headless backend, so we run the REAL `gui-agents` package INSIDE the E2B
+# desktop (which has the X display + can apt-install AT-SPI). The backend pushes a
+# small runner into the sandbox, bootstraps the package on first use (cached via a
+# sentinel), execs it on the live display, and relays its per-step JSONL as stream
+# events — so the user watches Agent-S move the real cursor. Any failure raises so
+# run() falls back to OpenInterpreter / the built-in vision loop (no regression).
+
+_AP_SENTINEL = "/opt/.fr_agent_s_ready"
+
+# Bootstrap: AT-SPI + tk/dev + scrot/gnome-screenshot (screenshots) + gui-agents +
+# pyautogui/xlib, in the sandbox's own python. Idempotent + cached by the sentinel.
+# Verified end-to-end against the real E2B desktop template: apt + pip + a full
+# AgentS2 build + predict all succeed (the only runtime dependency is OpenRouter
+# credit). The pip install pulls gui-agents 0.3.x, whose API is the S2 layout
+# (`gui_agents.s2.*`) — the runner below targets exactly that.
+_AP_BOOTSTRAP = r"""
+if [ -f "%(sentinel)s" ]; then echo FR_AP_CACHED; exit 0; fi
+export DEBIAN_FRONTEND=noninteractive
+(sudo apt-get update -qq || apt-get update -qq) >/tmp/ap_apt.log 2>&1 || true
+(sudo apt-get install -y -qq python3-pyatspi gir1.2-atspi-2.0 python3-tk python3-dev \
+  at-spi2-core scrot gnome-screenshot \
+  || apt-get install -y -qq python3-pyatspi gir1.2-atspi-2.0 python3-tk python3-dev \
+     at-spi2-core scrot gnome-screenshot) >>/tmp/ap_apt.log 2>&1 || true
+python3 -m pip install --quiet "setuptools<80" pyautogui python-xlib pillow gui-agents >/tmp/ap_pip.log 2>&1
+python3 -c "import gui_agents.s2.agents.agent_s, pyautogui" 2>>/tmp/ap_pip.log && \
+  { (sudo touch "%(sentinel)s" || touch "%(sentinel)s") 2>/dev/null; echo FR_AP_INSTALLED; } || echo FR_AP_IMPORT_FAIL
+""".strip()
+
+# The runner executes ON the desktop: it builds the REAL Agent-S (AgentS2 +
+# OSWorldACI, gui-agents 0.3.x) pointed at OpenRouter, then runs Simular AI's own
+# loop — predict -> exec the grounded pyautogui/ACI action on the live display —
+# streaming one JSON line per step (prefixed FRSTEP) that the backend relays live.
+# Faithful to gui_agents/s2/cli_app.py: `info, code = agent.predict(...)`, the
+# action is `code[0]`, completion is detected by "done"/"fail" in it, and the
+# grounded code calls `agent.<action>(...)` where `agent` is the ACI.
+_AP_RUNNER = r'''
+import sys, os, io, json, time, base64, subprocess, traceback
+def emit(o):
+    try: sys.stdout.write("FRSTEP " + json.dumps(o) + "\n"); sys.stdout.flush()
+    except Exception: pass
+def shot():
+    # scrot on the live display (pyautogui.screenshot needs gnome-screenshot and
+    # is flakier); full-res so coordinates map 1:1 to the ACI width/height.
+    try:
+        subprocess.run(["scrot", "-o", "-p", "/tmp/fr_ap.png"], check=False, timeout=15)
+        with open("/tmp/fr_ap.png", "rb") as f: return f.read()
+    except Exception:
+        import pyautogui; b = io.BytesIO(); pyautogui.screenshot().save(b, format="PNG"); return b.getvalue()
+def build(eng, grd):
+    """Construct (agent, aci) across gui-agents layouts; 0.3.x = S2."""
+    import pyautogui
+    W, H = pyautogui.size()
+    last = None
+    for mod in ("gui_agents.s2.agents", "gui_agents.s2_5.agents", "gui_agents.s3.agents"):
+        try:
+            import importlib
+            ag = importlib.import_module(mod + ".agent_s")
+            gr = importlib.import_module(mod + ".grounding")
+            ACICls = getattr(gr, "OSWorldACI")
+            AgentCls = getattr(ag, "AgentS2", None) or getattr(ag, "AgentS3", None) or getattr(ag, "AgentS")
+            aci = ACICls(platform="linux", engine_params_for_generation=eng,
+                         engine_params_for_grounding=grd, width=W, height=H)
+            for kw in (dict(platform="linux", observation_type="screenshot", search_engine=None, use_default_kb=False),
+                       dict(platform="linux", observation_type="screenshot", search_engine=None),
+                       dict(platform="linux", observation_type="screenshot"), {}):
+                try: return AgentCls(eng, aci, **kw), aci
+                except TypeError: continue
+        except Exception as e:
+            last = mod + ": " + repr(e)[:160]
+    raise RuntimeError("no Agent-S layout built: " + str(last))
+def main():
+    task = base64.b64decode(sys.argv[1]).decode("utf-8")
+    max_steps = int(sys.argv[2]) if len(sys.argv) > 2 else 15
+    import pyautogui; pyautogui.FAILSAFE = False
+    def _hermes_ok(task, thought, act):
+        # Hermes verifies a GUI action before it runs. ADVISORY by default (logs, always
+        # returns True); HERMES_GATE_ACTIONS=block lets Hermes veto destructive/off-task
+        # actions. Hermes off or any error => True (never blocks the desktop loop).
+        import os as _o, json as _j, urllib.request as _u
+        url = (_o.environ.get("HERMES_API_URL", "") or "").rstrip("/"); k = _o.environ.get("HERMES_API_KEY", "")
+        if not (url and k): return True
+        mode = _o.environ.get("HERMES_GATE_ACTIONS", "advisory").lower()
+        try:
+            ep = url + ("/chat/completions" if url.endswith("/v1") else "/v1/chat/completions")
+            sysmsg = ("You verify a GUI automation action before it runs. Given the TASK and the "
+                      "pyautogui ACTION, decide if it is safe and on-task. Reply as JSON with keys "
+                      "ok (boolean) and why (short). Set ok=false only for clearly destructive or off-task actions.")
+            b = {"model": _o.environ.get("HERMES_MODEL", "hermes-agent"),
+                 "messages": [{"role": "system", "content": sysmsg},
+                              {"role": "user", "content": "TASK: " + str(task)[:200] + " | ACTION: " + str(act)[:200]}],
+                 "max_tokens": 100, "response_format": {"type": "json_object"}, "stream": False}
+            rq = _u.Request(ep, data=_j.dumps(b).encode(), headers={"Authorization": "Bearer " + k, "Content-Type": "application/json"})
+            r = _j.load(_u.urlopen(rq, timeout=25)); t = r["choices"][0]["message"]["content"]
+            s = t.find("{"); e = t.rfind("}"); v = _j.loads(t[s:e + 1]) if s >= 0 and e > s else {}
+            ok = bool(v.get("ok", True))
+            try: emit({"gate_check": ok, "why": str(v.get("why"))[:100]})
+            except Exception: pass
+            return ok if mode == "block" else True
+        except Exception:
+            return True
+    key = os.environ["OPENROUTER_API_KEY"]; base = "https://openrouter.ai/api/v1"
+    eng = {"engine_type": "open_router", "model": os.environ.get("AP_PLAN_MODEL") or "anthropic/claude-sonnet-4.6", "api_key": key, "base_url": base}
+    grd = {"engine_type": "open_router", "model": os.environ.get("AP_GROUND_MODEL") or "openai/gpt-4o", "api_key": key, "base_url": base}
+    agent, aci = build(eng, grd)
+    try: agent.reset()
+    except Exception: pass
+    emit({"boot": "agent-s ready", "engine": "agent-s"})
+    for i in range(1, max_steps + 1):
+        png = shot()
+        try:
+            info, code = agent.predict(instruction=task, observation={"screenshot": png})
+        except Exception as e:
+            msg = str(e)[:200]
+            emit({"i": i, "error": "predict: " + msg})
+            emit({"done": True, "summary": "stopped at step %d: %s" % (i, msg)}); return
+        thought = ""
+        if isinstance(info, dict):
+            thought = str(info.get("executor_plan") or info.get("reflection") or info.get("subtask") or "")
+        act = str((code or [""])[0])
+        emit({"i": i, "engine": "agent-s", "thought": thought[:200], "code": act[:200],
+              "shot": base64.b64encode(png).decode()})
+        low = act.lower()
+        if "done" in low or "fail" in low:
+            emit({"done": True, "summary": "completed" if "done" in low else "agent could not proceed"}); return
+        if "next" in low:
+            continue
+        if "wait" in low:
+            time.sleep(3); continue
+        if not _hermes_ok(task, thought, act):
+            emit({"i": i, "gate": "skipped-by-hermes", "code": act[:120]}); time.sleep(0.3); continue
+        try:
+            exec(act, {"pyautogui": pyautogui, "time": time, "agent": aci})
+        except Exception as e:
+            emit({"i": i, "error": "exec: " + str(e)[:160]})
+        time.sleep(1.0)
+    emit({"done": True, "summary": "reached step budget"})
+try: main()
+except Exception as e:
+    emit({"fatal": (str(e) + " | " + traceback.format_exc())[-500:]})
+'''
+
+
+def _bootstrap_agent_s(d, emit: Callable[[dict[str, Any]], None]) -> bool:
+    """Install the real gui-agents package into the sandbox (cached). Returns
+    True if `import gui_agents.s2.agents.agent_s, pyautogui` succeeds there."""
+    from services.computer_agent import _run, _stdout
+    script = _AP_BOOTSTRAP % {"sentinel": _AP_SENTINEL}
+    b64 = base64.b64encode(script.encode()).decode()
+    emit({"engine": "agent-s", "action": "bootstrap",
+          "thought": "provisioning Agent-S into the desktop (first run installs it, ~90s)…"})
+    res = _run(d, f"bash -c \"$(echo {b64} | base64 -d)\"", timeout=420)
+    out = _stdout(res)
+    ok = ("FR_AP_CACHED" in out) or ("FR_AP_INSTALLED" in out)
+    if not ok:
+        # Verify directly — the sentinel/echo may be lost but the import can still work.
+        chk = _stdout(_run(d, "python3 -c 'import gui_agents.s2.agents.agent_s, pyautogui' "
+                              "&& echo FR_AP_OK", timeout=60))
+        ok = "FR_AP_OK" in chk
+    log.info("autopilot: agent-s bootstrap ok=%s tail=%s", ok, out[-160:].replace("\n", " "))
+    return ok
+
+
+def run_gui(sandbox_id: str, task: str, emit: Callable[[dict[str, Any]], None], *,
+            max_steps: int, budget_s: int, cancel: Callable[[], bool] | None = None) -> dict[str, Any]:
+    """Drive the E2B desktop with the REAL Agent-S, running INSIDE the sandbox.
+    Streams a step event per Agent-S action. Raises on setup failure so run()
+    can fall back to OpenInterpreter / the vision loop."""
+    from services.computer_agent import _connect, _display
+
+    d = _connect(sandbox_id)
+    disp = _display(d)
+    if not _bootstrap_agent_s(d, emit):
+        raise RuntimeError("agent-s could not be provisioned into the sandbox")
+
+    steps = min(max_steps, _MAX_STEPS_CAP)
+    tb64 = base64.b64encode(task.encode()).decode()
+    rb64 = base64.b64encode(_AP_RUNNER.encode()).decode()
+    # Materialise the runner on the desktop, then exec it on the live display with
+    # the LLM keys/models in its env. We stream stdout so each FRSTEP line becomes
+    # a live event the user sees as it happens.
+    setup = (f"echo {rb64} | base64 -d > /tmp/fr_agent_s.py")
+    from services.computer_agent import _run
+    _run(d, setup, timeout=30)
+
+    _he = os.environ
+    _hermes_env = ""
+    if _he.get("HERMES_API_URL") and _he.get("HERMES_API_KEY"):
+        _hermes_env = (f"HERMES_API_URL={_he['HERMES_API_URL']} HERMES_API_KEY={_he['HERMES_API_KEY']} "
+                       f"HERMES_GATE_ACTIONS={_he.get('HERMES_GATE_ACTIONS', 'advisory')} "
+                       f"HERMES_MODEL={_he.get('HERMES_MODEL', 'hermes-agent')} ")
+    env = (f"DISPLAY={disp} OPENROUTER_API_KEY={_OR_KEY()} {_hermes_env}"
+           f"AP_PLAN_MODEL={_PLAN_MODEL()} AP_GROUND_MODEL={_GROUND_MODEL()}")
+    cmd = f"{env} python3 -u /tmp/fr_agent_s.py {tb64} {steps}"
+
+    state: dict[str, Any] = {"last": "reached step budget", "n": 0, "ok": True}
+
+    def _on_line(line: str) -> None:
+        line = (line or "").strip()
+        if not line.startswith("FRSTEP "):
+            return
+        try:
+            o = json.loads(line[len("FRSTEP "):])
+        except Exception:
+            return
+        if o.get("boot"):
+            emit({"engine": "agent-s", "action": "start", "thought": o["boot"]}); return
+        if o.get("fatal"):
+            state["ok"] = False; state["last"] = "agent-s error: " + str(o["fatal"])[:160]
+            emit({"engine": "agent-s", "action": "error", "detail": str(o["fatal"])[:200]}); return
+        if o.get("error"):
+            emit({"engine": "agent-s", "action": "error", "i": o.get("i"),
+                  "detail": str(o["error"])[:180]}); return
+        if o.get("done"):
+            state["last"] = str(o.get("summary") or "done"); return
+        state["n"] = max(state["n"], int(o.get("i") or 0))
+        ev = {"engine": "agent-s", "action": "gui", "i": o.get("i"),
+              "thought": str(o.get("thought") or "operating the desktop")[:200],
+              "detail": str(o.get("code") or "")[:160]}
+        if o.get("shot"):
+            ev["screenshot"] = o["shot"]
+        emit(ev)
+
+    _run_streaming(d, cmd, _on_line, timeout=min(budget_s, _HARD_BUDGET_S), cancel=cancel)
+    return {"ok": state["ok"], "summary": state["last"], "steps": state["n"]}
+
+
+def _run_streaming(d, cmd: str, on_line: Callable[[str], None], *,
+                   timeout: int, cancel: Callable[[], bool] | None = None) -> None:
+    """Run a command in the sandbox, delivering stdout line-by-line to on_line.
+    Uses E2B's on_stdout callback when available; else falls back to a blocking
+    run and replays the captured stdout."""
+    from services.computer_agent import _run, _stdout
+    try:
+        d.commands.run(cmd, timeout=timeout, on_stdout=on_line,
+                       on_stderr=lambda _l: None)
+        return  # streamed live via on_stdout
+    except TypeError:
+        pass  # SDK build without on_stdout — fall back to blocking capture below
+    except Exception as e:
+        # Streaming WAS accepted but the command later errored (e.g. timeout);
+        # its lines were already delivered live, so don't replay (would double).
+        # Only surface anything we haven't seen if nothing streamed at all.
+        so = str(getattr(e, "stdout", "") or "")
+        if so:
+            for ln in so.splitlines():
+                on_line(ln)
+        log.info("autopilot: streaming run raised: %s", str(e)[:140])
+        return
+    # Blocking fallback (no on_stdout support): run to completion, replay stdout.
+    res = _run(d, cmd, timeout=timeout)
+    for ln in _stdout(res).splitlines():
+        on_line(ln)
+
+
+# ─────────────────────── OpenInterpreter code engine ───────────────────────
+
+def run_code(task: str, emit: Callable[[dict[str, Any]], None], *,
+             sandbox=None, disp: str | None = None, budget_s: int = 180) -> dict[str, Any]:
+    """Run a CODE task with real OpenInterpreter. If a sandbox is given, code
+    runs ON the E2B desktop (so it affects the machine on screen); otherwise OI
+    runs it in-process. Streams thought/output events."""
+    from interpreter import OpenInterpreter
+
+    oi = OpenInterpreter()
+    oi.llm.model = _CODE_MODEL()
+    if _OR_KEY():
+        oi.llm.api_key = _OR_KEY()
+        oi.llm.api_base = "https://openrouter.ai/api/v1"
+    oi.auto_run = True          # non-interactive: it executes without asking
+    oi.safe_mode = "off"
+    oi.max_output = 2000
+    # Route execution onto the E2B desktop when we have one.
+    if sandbox is not None:
+        _bind_oi_to_desktop(oi, sandbox, disp)
+
+    emit({"engine": "open-interpreter", "thought": f"writing + running code: {task[:120]}",
+          "action": "code", "detail": ""})
+    out_summary = ""
+    try:
+        for chunk in oi.chat(task, stream=True, display=False):
+            if not isinstance(chunk, dict):
+                continue
+            role, typ = chunk.get("role"), chunk.get("type")
+            content = chunk.get("content")
+            if typ in ("code", "console") and content:
+                emit({"engine": "open-interpreter", "action": typ,
+                      "detail": str(content)[:160]})
+            if role == "assistant" and typ == "message" and content:
+                out_summary = (out_summary + str(content))[:1500]
+    except Exception as e:  # noqa: BLE001
+        log.info("open-interpreter run: %s", str(e)[:160])
+        return {"ok": False, "summary": f"code step hit a snag: {str(e)[:120]}"}
+    return {"ok": True, "summary": out_summary or "code step done"}
+
+
+def _bind_oi_to_desktop(oi, d, disp: str | None) -> None:
+    """Make OpenInterpreter's shell/python run on the E2B desktop instead of the
+    backend, so its code affects the very machine the user is watching."""
+    from services.computer_agent import _run, _stdout
+
+    def _exec_on_desktop(code: str, lang: str = "shell"):
+        if lang in ("python", "python3"):
+            b64 = base64.b64encode(code.encode()).decode()
+            cmd = f"{'DISPLAY=' + disp + ' ' if disp else ''}python3 -c \"import base64;exec(base64.b64decode('{b64}').decode())\""
+        else:
+            cmd = (f"DISPLAY={disp} " if disp else "") + code
+        try:
+            return _stdout(_run(d, cmd, timeout=60))
+        except Exception as e:  # noqa: BLE001
+            return f"desktop exec error: {str(e)[:120]}"
+
+    # OpenInterpreter exposes a `computer.run(language, code)` seam; override it.
+    try:
+        comp = oi.computer
+        orig = comp.run
+
+        def patched(language, code, *a, **k):
+            try:
+                return [{"role": "computer", "type": "console", "format": "output",
+                         "content": _exec_on_desktop(code, language)}]
+            except Exception:
+                return orig(language, code, *a, **k)
+        comp.run = patched
+    except Exception as e:
+        log.info("oi desktop bind skipped: %s", str(e)[:120])
+
+
+# ─────────────────────────── unified entry ───────────────────────────
+
+def run(sandbox_id: str, task: str, *,
+        on_step: Callable[[dict[str, Any]], None] | None = None,
+        max_steps: int = 24, budget_s: int = 240,
+        cancel: Callable[[], bool] | None = None, **_) -> dict[str, Any]:
+    """The best autopilot: Agent-S drives the GUI, OpenInterpreter runs code.
+    Same event/return shape as services.computer_agent.run. Raises only on a
+    hard setup failure so callers can fall back."""
+    emit = on_step or (lambda _e: None)
+    emit({"engine": "autopilot", "thought": "Agent-S (GUI) + OpenInterpreter (code) engaged",
+          "action": "start", "detail": str(engines())})
+    # GUI brain: the real Agent-S, run inside the sandbox. If it can't be
+    # provisioned there (or makes no progress), fall through to the code brain.
+    if gui_available():
+        try:
+            r = run_gui(sandbox_id, task, emit, max_steps=max_steps,
+                        budget_s=budget_s, cancel=cancel)
+            if r.get("steps") or r.get("ok"):
+                return r
+            log.info("autopilot: agent-s made no progress; trying OpenInterpreter")
+        except Exception as e:  # noqa: BLE001
+            emit({"engine": "agent-s", "action": "error",
+                  "thought": "Agent-S unavailable on this desktop, switching to OpenInterpreter",
+                  "detail": str(e)[:160]})
+            log.info("autopilot: run_gui failed, falling back to code: %s", str(e)[:150])
+    # Code brain: real OpenInterpreter, executing on the same desktop.
+    if code_available():
+        from services.computer_agent import _connect, _display
+        d = _connect(sandbox_id)
+        return run_code(task, emit, sandbox=d, disp=_display(d), budget_s=budget_s)
+    raise RuntimeError("autopilot_engine: neither Agent-S nor OpenInterpreter available")
