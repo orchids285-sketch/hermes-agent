@@ -74,3 +74,16 @@ BETTER tool (builds a valid step via the organ→param map). **OPT-IN: default O
 compliance + approval-gated sends downstream are untouched. Proven live: a premature
 `finish` was redirected to `hunt("fintech founder reddit")`. File: mission/mission_runner.py.patched.
 (Primary mission path = services/agent_graph.py tool-calling agent; wire on request.)
+
+## 5th orchestrator wired — agent_graph (PRIMARY mission tool-caller)
+`backend/services/agent_graph.py` = LangGraph `create_react_agent` (Claude Opus + tools),
+the primary path missions take. Added `_hermes_mission_strategy`: when HERMES_DIRECT_MISSION=1,
+Hermes returns memory-informed directives PREPENDED to the agent's system prompt. AUGMENTS
+(Claude stays the model + keeps its tools) — does NOT replace. Graceful/opt-in. Proven live:
+Hermes returned concrete directives (targeted Reddit DMs, 3-touch follow-up, tracking sheet).
+File: mission/agent_graph.py.patched.
+
+## COVERAGE — 5 orchestrators now Hermes-directed
+brain (enforced gate) · supervisor + campaign (advisory gates) · mission_runner (_decide director) ·
+agent_graph (strategy injection). Remaining: computer-use (autopilot_engine, Agent-S/OI) — needs a
+DIFFERENT gate (verify a GUI action ≠ score text); wire on request. All graceful: Hermes off => unchanged.

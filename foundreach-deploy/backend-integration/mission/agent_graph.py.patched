@@ -1,0 +1,368 @@
+"""services/agent_graph.py — the AI employee's brain, built on LangGraph.
+
+This is the REAL autonomous agent behind the "employee that controls everything"
+promise. It is a LangGraph tool-calling ReAct agent (langgraph.prebuilt) whose
+tools are the product's real organs — the same in-process functions the app
+exposes to a human — so a single mission ("find my best SaaS buyers on reddit,
+write them, and book calls") is planned and executed end to end by the model
+itself, deciding which organ to call next from the actual results, never asking
+the user mid-mission.
+
+Why LangGraph + native tool-calling (not a hand-rolled JSON loop):
+  • the model emits real tool calls (function-calling) → no JSON-in-prose parsing
+    roulette, far fewer mis-routes;
+  • the graph owns state/looping/stop conditions → robust, inspectable;
+  • it runs on the premium model (Claude Opus 4.8 via OpenRouter) with a Groq
+    fallback, both OpenAI-compatible, so tool-calling stays available and cheap.
+
+The organs (LangChain @tools, closed over the caller's user_id):
+  hunt · draft_openers · draft_followups · do_action · operate · browse
+
+Safety: drafting stays drafting (sends remain approval-gated downstream);
+compliance_guard still gates every automated send. The agent cannot invent
+side effects — it can only call these six typed tools.
+
+`run(user_id, mission)` yields the SAME event dicts the legacy runner did
+({type:'step'|'observe'|'done'}), so the frontend ghost narration is unchanged.
+If LangGraph / the tool-calling model is unavailable, callers fall back to the
+legacy loop — see services.mission_runner.
+"""
+from __future__ import annotations
+
+import os
+from typing import Any, Generator
+
+from lib.logger import get_logger
+
+log = get_logger()
+
+MAX_STEPS = 8
+
+# Which real tab best shows a given organ's result (drives the ghost's navigate).
+_TOOL_TAB = {
+    "hunt": "chat",
+    "draft_openers": "automations",
+    "draft_followups": "automations",
+    "do_action": "home",
+    "operate": "home",
+    "browse": "liveagent",
+}
+
+_SYS = (
+    "You are the autonomous brain of a B2B growth employee working INSIDE the "
+    "user's FoundReach workspace. You are given ONE mission and you complete it "
+    "end to end by calling your tools — you decide every step yourself from the "
+    "real results, with sensible defaults, and NEVER ask the user anything.\n"
+    "Playbook:\n"
+    "- To find buyers/leads/prospects, call hunt (it searches the open web and "
+    "auto-captures results to the CRM — do not 'add to CRM' afterwards).\n"
+    "- Right after a hunt that found people, draft_openers is almost always next.\n"
+    "- Use draft_followups for contacts who never replied.\n"
+    "- Use do_action for a concrete action (book / remind / alert / update CRM).\n"
+    "- Use operate to act inside a connected tool (CRM/social/docs).\n"
+    "- Use browse only for a task that truly needs a real browser (scrape a "
+    "specific site, fill a form, check a page).\n"
+    "- Stop as soon as the mission is genuinely covered; don't invent extra work.\n"
+    "Keep going until done. When finished, reply with ONE honest sentence "
+    "summarizing what you actually accomplished."
+)
+
+
+# OpenRouter fallback ladder — Opus 4.8 leads (premium), then Sonnet, then a
+# free tool-calling model, so the agent keeps function-calling even at $0 credit.
+# OpenRouter applies this `models` array SERVER-SIDE (one HTTP call, automatic
+# hop on 402/429/error) — no client with_fallbacks (which breaks bind_tools).
+_OR_AGENT_MODELS = [
+    "anthropic/claude-opus-4.8",
+    "anthropic/claude-sonnet-4.6",
+    "meta-llama/llama-3.3-70b-instruct",
+]
+
+
+def _providers() -> list[str]:
+    out: list[str] = []
+    if os.environ.get("OPENROUTER_API_KEY"):
+        out.append("openrouter")
+    if os.environ.get("GROQ_API_KEY"):
+        out.append("groq")
+    return out
+
+
+def _chat(provider: str):
+    """A single OpenAI-compatible tool-calling ChatModel for the given provider.
+    Returned bare (create_react_agent binds the tools) so bind_tools works."""
+    from langchain_openai import ChatOpenAI
+    if provider == "openrouter":
+        primary = os.environ.get("AGENT_OR_MODEL", "anthropic/claude-opus-4.8")
+        ladder = [primary] + [m for m in _OR_AGENT_MODELS if m != primary]
+        return ChatOpenAI(
+            model=primary,
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.environ["OPENROUTER_API_KEY"],
+            temperature=0.2, timeout=45, max_retries=1,
+            default_headers={"HTTP-Referer": "https://foundrreach.app",
+                             "X-Title": "FoundReach"},
+            extra_body={"models": ladder})  # OpenRouter server-side model fallback
+    if provider == "groq":
+        return ChatOpenAI(
+            model=os.environ.get("AGENT_GROQ_MODEL", "llama-3.3-70b-versatile"),
+            base_url="https://api.groq.com/openai/v1",
+            api_key=os.environ["GROQ_API_KEY"],
+            temperature=0.2, timeout=45, max_retries=1)
+    raise RuntimeError(f"unknown agent provider {provider!r}")
+
+
+def _tools(user_id: str) -> list[Any]:
+    """The six real organs as LangChain tools, closed over user_id. Each returns a
+    short string observation for the model and never raises (a failing organ must
+    not kill the mission)."""
+    from langchain_core.tools import tool
+
+    @tool
+    def hunt(query: str) -> str:
+        """Search the open web (reddit, linkedin, hacker news, github, quora, …) for
+        buyers/leads matching the query. Results are automatically captured to the
+        CRM. `query` = who to find and where. Returns how many signals landed."""
+        try:
+            from routers.agent import AgentRun, run as agent_run
+            r = agent_run(AgentRun(user_id=user_id, prompt=str(query)[:400]))
+            n = len(r.get("results") or [])
+            return f"{n} buyer signal(s) found and captured to the CRM. {r.get('summary', '')}".strip()[:600]
+        except Exception as e:  # noqa: BLE001
+            log.info("agent tool hunt failed: %s", str(e)[:120])
+            return f"hunt hit a snag: {str(e)[:120]}"
+
+    @tool
+    def draft_openers(goal: str) -> str:
+        """Write personalized first-touch messages for the hottest uncontacted leads.
+        `goal` = the offer / angle. Drafts land in the approval queue (never sent
+        automatically). Returns how many were drafted."""
+        try:
+            from services import autopilot
+            r = autopilot.generate(user_id, str(goal)[:300], limit=8)
+            return f"{int(r.get('drafted') or 0)} opener(s) drafted to the approval queue. {r.get('note') or ''}".strip()[:400]
+        except Exception as e:  # noqa: BLE001
+            log.info("agent tool draft_openers failed: %s", str(e)[:120])
+            return f"draft_openers hit a snag: {str(e)[:120]}"
+
+    @tool
+    def draft_followups(goal: str) -> str:
+        """Write multi-touch follow-ups for contacts who never replied. `goal` = the
+        offer / angle. Drafts stay approval-gated. Returns how many were drafted."""
+        try:
+            from services import autopilot
+            r = autopilot.draft_followups(user_id, str(goal)[:300], limit=6)
+            return f"{int(r.get('drafted') or 0)} follow-up(s) drafted to the approval queue."[:400]
+        except Exception as e:  # noqa: BLE001
+            log.info("agent tool draft_followups failed: %s", str(e)[:120])
+            return f"draft_followups hit a snag: {str(e)[:120]}"
+
+    @tool
+    def do_action(instruction: str) -> str:
+        """Execute ONE concrete action: book a meeting, set a reminder, create an
+        alert, or update the CRM. `instruction` = the action in plain language."""
+        try:
+            from services import actions
+            r = actions.plan_and_run(user_id, str(instruction)[:300])
+            return (r.get("summary") or "action executed")[:300]
+        except Exception as e:  # noqa: BLE001
+            log.info("agent tool do_action failed: %s", str(e)[:120])
+            return f"do_action hit a snag: {str(e)[:120]}"
+
+    @tool
+    def operate(instruction: str) -> str:
+        """Act INSIDE a connected tool (CRM / social / docs): e.g. 'create a deal for
+        X', 'post the update', 'add a note'. `instruction` = what to do, in which
+        tool. Returns what was executed."""
+        try:
+            from lib import operator_executor as oe
+            acts = oe.execute(user_id, str(instruction)[:300], "") or []
+            return (oe.summarize(acts) if acts
+                    else "No direct tool action was needed for that step.")[:300]
+        except Exception as e:  # noqa: BLE001
+            log.info("agent tool operate failed: %s", str(e)[:120])
+            return f"operate hit a snag: {str(e)[:120]}"
+
+    @tool
+    def browse(task: str) -> str:
+        """Drive a REAL browser for a task the other organs can't do: scrape a
+        specific site, fill a form, check a live page. `task` = the browsing goal.
+        Runs up to ~90s and returns the result (or that it's still running)."""
+        try:
+            import time as _t
+            from routers import browser_agent as ba
+            r = ba.start_run(user_id, str(task)[:400], max_steps=18)
+            if not r.get("ok"):
+                return f"browser unavailable ({r.get('error', 'not configured')}); do it another way."
+            rid = r["run_id"]
+            for _ in range(30):
+                _t.sleep(3)
+                st = ba.run_status(rid)
+                if st.get("status") in ("done", "error"):
+                    return (st.get("result") or st.get("error") or "browser run finished")[:400]
+            return "Browser is still working — it will keep going in the Live Agent."
+        except Exception as e:  # noqa: BLE001
+            log.info("agent tool browse failed: %s", str(e)[:120])
+            return f"browse hit a snag: {str(e)[:120]}"
+
+    return [hunt, draft_openers, draft_followups, do_action, operate, browse]
+
+
+def is_available() -> bool:
+    """True when the LangGraph tool-calling agent can run (deps + a key present)."""
+    if not _providers():
+        return False
+    try:
+        import langgraph.prebuilt  # noqa: F401
+        import langchain_openai  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def run(user_id: str, mission: str,
+        max_steps: int = MAX_STEPS) -> Generator[dict[str, Any], None, None]:
+    """Run the mission on the LangGraph agent, yielding {type:'step'|'observe'|'done'}
+    events (same shape the legacy runner used).
+
+    Tries each configured provider (OpenRouter → Groq) but only fails OVER while
+    NOTHING has been emitted yet — once we've streamed a step we can't restart, so
+    a mid-stream error ends the mission honestly. Raises only if EVERY provider
+    fails at setup before emitting, so services.mission_runner can fall back to the
+    legacy loop. Per-organ failures are absorbed into 'observe' events."""
+    providers = _providers()
+    last_exc: Exception | None = None
+    for i, prov in enumerate(providers):
+        emitted = False
+        try:
+            for ev in _run_one(prov, user_id, mission, max_steps):
+                emitted = True
+                yield ev
+            return
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            if emitted:
+                log.info("agent_graph %s errored mid-stream: %s", prov, str(e)[:120])
+                yield {"type": "done",
+                       "summary": "I hit a snag mid-run — I'll pick this up on the next cycle."}
+                return
+            log.info("agent_graph %s setup failed (%s) — %s", prov, str(e)[:120],
+                     "trying next provider" if i + 1 < len(providers) else "no more providers")
+            continue
+    raise last_exc if last_exc else RuntimeError("no agent provider available")
+
+
+def _hermes_mission_strategy(mission: str) -> str:
+    """OPT-IN director (HERMES_DIRECT_MISSION=1): Hermes returns strategic directives from
+    its memory of what worked, to PREPEND to the react agent's system prompt. This AUGMENTS
+    the tool-calling agent (Claude stays the brain + keeps its tools) — it does NOT replace
+    the model. Default OFF and any failure returns "" so the agent is never disturbed."""
+    import os as _os
+    if _os.environ.get("HERMES_DIRECT_MISSION", "0") not in ("1", "true", "yes"):
+        return ""
+    url = (_os.environ.get("HERMES_API_URL", "") or "").rstrip("/")
+    k = _os.environ.get("HERMES_API_KEY", "")
+    if not (url and k):
+        return ""
+    import json as _j, urllib.request as _u
+    ep = url + ("/chat/completions" if url.endswith("/v1") else "/v1/chat/completions")
+    body = {"model": _os.environ.get("HERMES_MODEL", "hermes-agent"), "messages": [
+        {"role": "system", "content": "You direct an autonomous sales employee. Give 3-4 concrete, "
+         "specific directives (from your memory of what works) to make THIS mission produce "
+         "top-tier results. No preamble, just the directives."},
+        {"role": "user", "content": mission[:500]}], "max_tokens": 300, "stream": False}
+    try:
+        req = _u.Request(ep, data=_j.dumps(body).encode(),
+                         headers={"Authorization": "Bearer " + k, "Content-Type": "application/json"})
+        r = _j.load(_u.urlopen(req, timeout=45))
+        return ((r.get("choices") or [{}])[0].get("message", {}).get("content", "") or "").strip()
+    except Exception as ex:  # noqa: BLE001 — director must never break the mission
+        log.info("hermes mission-strategy skipped: %s", str(ex)[:100])
+        return ""
+
+
+def _run_one(provider: str, user_id: str, mission: str,
+             max_steps: int) -> Generator[dict[str, Any], None, None]:
+    """Stream ONE provider's run. Yields step/observe/done events."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from langgraph.prebuilt import create_react_agent
+
+    sys_prompt = _SYS
+    _directive = _hermes_mission_strategy(mission)
+    if _directive:
+        sys_prompt = _SYS + "\n\n[DIRECTEUR Hermes — appliquer, appris des runs passés]:\n" + _directive
+        log.info("agent_graph: directives Hermes injectées")
+    agent = create_react_agent(_chat(provider), _tools(user_id))
+    # recursion_limit bounds tool-call rounds; each round = model + tool node.
+    cfg = {"recursion_limit": max_steps * 2 + 2}
+    inputs = {"messages": [SystemMessage(content=sys_prompt),
+                           HumanMessage(content=mission[:500])]}
+
+    n = 0
+    last_ai_text = ""
+    wins: list[str] = []  # meaningful tool outcomes, for an honest final roll-up
+    for update in agent.stream(inputs, config=cfg, stream_mode="updates"):
+        for _node, payload in (update or {}).items():
+            for m in (payload or {}).get("messages") or []:
+                mtype = getattr(m, "type", "")
+                tcs = getattr(m, "tool_calls", None) or []
+                if mtype == "ai" and tcs:
+                    for tc in tcs:
+                        name = tc.get("name") or ""
+                        args = tc.get("args") or {}
+                        n += 1
+                        yield {"type": "step", "n": n,
+                               "say": _say_for(name, args), "tool": name}
+                elif mtype == "ai":
+                    txt = (m.content if isinstance(m.content, str)
+                           else _text_of(m.content)).strip()
+                    if txt:
+                        last_ai_text = txt
+                elif mtype == "tool":
+                    name = getattr(m, "name", "") or ""
+                    content = (m.content if isinstance(m.content, str)
+                               else _text_of(m.content)).strip()
+                    low = content.lower()
+                    ok = ("hit a snag" not in low and "unavailable" not in low)
+                    # Track outcomes that actually moved the mission forward so the
+                    # final summary reflects real work — never a bare "no action
+                    # needed" tail. Skip empty/no-op organ returns.
+                    if ok and content and "no direct tool action" not in low \
+                            and "no action" not in low:
+                        wins.append(content[:140])
+                    yield {"type": "observe", "n": n, "ok": ok,
+                           "summary": content[:300],
+                           "tab": _TOOL_TAB.get(name, "home")}
+
+    # Final summary: prefer the model's own wrap-up; otherwise roll up what
+    # actually landed. Never end on a raw "nothing to execute" tool string.
+    if last_ai_text:
+        final = last_ai_text
+    elif wins:
+        final = "Here's what I got done: " + "; ".join(wins[-4:])
+    else:
+        final = ("I ran the search but found nothing that matches this specific "
+                 "ask right now — tell me to broaden it and I'll go again.")
+    yield {"type": "done", "summary": final[:400], "steps": n}
+
+
+def _say_for(name: str, args: dict[str, Any]) -> str:
+    """Short live narration for a tool call (what the ghost banner shows)."""
+    a = " ".join(str(v) for v in (args or {}).values())[:70]
+    return {
+        "hunt": f"Hunting the open web: {a}" if a else "Hunting the open web for your buyers.",
+        "draft_openers": "Writing personalized openers for the hottest leads.",
+        "draft_followups": "Drafting follow-ups for people who never replied.",
+        "do_action": f"Doing it: {a}" if a else "Executing that action now.",
+        "operate": f"Operating your tool: {a}" if a else "Acting inside your connected tool.",
+        "browse": f"Driving a real browser: {a}" if a else "Driving a real browser for this.",
+    }.get(name, "Working…")
+
+
+def _text_of(content: Any) -> str:
+    """Flatten LangChain block-list message content to plain text."""
+    if isinstance(content, list):
+        return " ".join(
+            (b.get("text") or "") if isinstance(b, dict) else str(b)
+            for b in content).strip()
+    return str(content or "")
