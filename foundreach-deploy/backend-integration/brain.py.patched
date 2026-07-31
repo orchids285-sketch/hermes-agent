@@ -1,0 +1,222 @@
+"""core/brain.py — Graphe d'état central (LangGraph).
+
+Le cerveau orchestre la boucle infinie de l'agent :
+  PERCEVOIR → PLANIFIER → DÉLÉGUER → EXÉCUTER → CRITIQUER → MÉMORISER → DÉCIDER
+
+On utilise `langgraph.graph.StateGraph` (importé tel quel) — chaque nœud
+appelle un module spécialisé (planner, crew, scrapers, critic, memory).
+Aucune logique de graphe n'est réécrite : on déclare les arêtes, c'est
+LangGraph qui fait tourner.
+"""
+from __future__ import annotations
+
+import operator
+from typing import Annotated, Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+from loguru import logger
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  État partagé entre tous les nœuds du graphe
+# ──────────────────────────────────────────────────────────────────────
+
+
+class AgentState(TypedDict, total=False):
+    """État typé qui circule à travers le graphe LangGraph.
+
+    Les champs `Annotated[..., operator.add]` sont des accumulateurs
+    (LangGraph fusionne automatiquement les listes des branches parallèles).
+    """
+
+    objective: str                                  # Mission globale (config.yaml)
+    iteration: int                                  # Numéro de tour
+    # Données récoltées par les scrapers
+    raw_signals: Annotated[list[dict[str, Any]], operator.add]
+    # Tâches générées par BabyAGI
+    tasks: list[dict[str, Any]]
+    # Résultats produits par CrewAI
+    crew_outputs: Annotated[list[dict[str, Any]], operator.add]
+    # Verdicts du critique (AutoGen)
+    critiques: Annotated[list[dict[str, Any]], operator.add]
+    # Doit-on continuer la boucle ?
+    keep_going: bool
+    # ── Champs du DIRECTEUR Hermes (voir core/hermes_director.py) ──
+    redo_tasks: list[dict[str, Any]]   # tâches correctives si la qualité échoue
+    redo_count: int                    # nb de reprises déjà faites (plafonné)
+    quality_score: Any                 # score du dernier gate (0-10) ou None
+    accepted: bool                     # le gate a-t-il accepté la sortie
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Nœuds du graphe — chacun est un wrapper fin sur un module dédié
+# ──────────────────────────────────────────────────────────────────────
+
+
+def perceive(state: AgentState) -> dict[str, Any]:
+    """Nœud PERCEVOIR : lance les scrapers et renvoie les signaux bruts."""
+    from ultimate_agent.scrapers import linkedin, reddit, twitter
+
+    logger.info("[brain] perceive — itération {}", state.get("iteration", 0))
+    signals: list[dict[str, Any]] = []
+    try:
+        signals.extend(linkedin.discover_signals(state.get("objective", "")))
+    except Exception as exc:  # noqa: BLE001 — on dégrade proprement
+        logger.warning("linkedin scrape échoué : {}", exc)
+    try:
+        signals.extend(twitter.discover_signals(state.get("objective", "")))
+    except Exception as exc:
+        logger.warning("twitter scrape échoué : {}", exc)
+    try:
+        signals.extend(reddit.discover_signals(state.get("objective", "")))
+    except Exception as exc:
+        logger.warning("reddit scrape échoué : {}", exc)
+    return {"raw_signals": signals}
+
+
+def plan(state: AgentState) -> dict[str, Any]:
+    """Nœud PLANIFIER : BabyAGI génère la prochaine liste de tâches.
+
+    Hermes (directeur) injecte des directives issues de sa mémoire des runs
+    passés — self-improvement. Si Hermes est off, `strategize` renvoie "" et
+    le planner se comporte comme avant."""
+    from ultimate_agent.core.planner import generate_tasks
+    from ultimate_agent.core import hermes_director
+
+    objective = state.get("objective", "")
+    directives = hermes_director.strategize(objective, state.get("raw_signals", []))
+    if directives:
+        objective = (f"{objective}\n\n[DIRECTEUR — appliquer, appris des runs "
+                     f"passés]:\n{directives}")
+        logger.info("[brain] plan — directives Hermes injectées")
+    tasks = generate_tasks(objective=objective,
+                           context_signals=state.get("raw_signals", []))
+    logger.info("[brain] plan — {} tâches générées", len(tasks))
+    return {"tasks": tasks}
+
+
+def delegate(state: AgentState) -> dict[str, Any]:
+    """Nœud DÉLÉGUER + EXÉCUTER : CrewAI assigne et fait tourner l'équipe.
+
+    Si le gate Hermes a rejeté le tour précédent, on RELANCE le crew sur les
+    tâches CORRECTIVES (`redo_tasks`) au lieu du plan initial, et on incrémente
+    le compteur de reprises (plafonné dans hermes_director)."""
+    from ultimate_agent.agents.researcher import run_crew
+
+    redo = state.get("redo_tasks") or []
+    tasks = redo or state.get("tasks", [])
+    if redo:
+        logger.info("[brain] delegate — REPRISE ({} tâches correctives)", len(redo))
+    outputs = run_crew(tasks=tasks, signals=state.get("raw_signals", []))
+    logger.info("[brain] delegate — {} outputs du crew", len(outputs))
+    out: dict[str, Any] = {"crew_outputs": outputs}
+    if redo:
+        out["redo_count"] = int(state.get("redo_count", 0)) + 1
+        out["redo_tasks"] = []          # consommées
+    return out
+
+
+def critique(state: AgentState) -> dict[str, Any]:
+    """Nœud CRITIQUER : AutoGen relit les outputs et note la qualité."""
+    from ultimate_agent.agents.critic import critique_outputs
+
+    verdicts = critique_outputs(state.get("crew_outputs", []))
+    logger.info("[brain] critique — {} verdicts", len(verdicts))
+    return {"critiques": verdicts}
+
+
+def gate(state: AgentState) -> dict[str, Any]:
+    """Nœud GATE (directeur Hermes) : lit les outputs + les critiques AutoGen
+    et DÉCIDE — accepter, ou REPRENDRE avec des tâches correctives concrètes.
+    C'est ce nœud qui ferme la boucle qualité laissée ouverte. Hermes off =>
+    accept toujours vrai (comportement d'avant)."""
+    from ultimate_agent.core import hermes_director
+
+    v = hermes_director.quality_gate(
+        state.get("crew_outputs", []), state.get("critiques", []),
+        redo_count=int(state.get("redo_count", 0)))
+    logger.info("[brain] gate — score={} accept={} ({})",
+                v.get("score"), v.get("accept"), v.get("reason"))
+    accept = bool(v.get("accept", True))
+    return {"accepted": accept, "quality_score": v.get("score"),
+            "redo_tasks": [] if accept else (v.get("redo_tasks") or [])}
+
+
+def route_after_critique(state: AgentState) -> str:
+    """Si le gate a rejeté ET produit des tâches correctives → REPRENDRE
+    (retour à delegate) ; sinon → continuer (memorize)."""
+    if not state.get("accepted", True) and (state.get("redo_tasks") or []):
+        return "redo"
+    return "ok"
+
+
+def memorize(state: AgentState) -> dict[str, Any]:
+    """Nœud MÉMORISER : ChromaDB (court terme) + Hermes (mémoire durable
+    inter-run = self-improvement)."""
+    from ultimate_agent.core.memory import remember
+    from ultimate_agent.core import hermes_director
+
+    remember(state.get("crew_outputs", []), state.get("critiques", []))
+    hermes_director.learn(state.get("objective", ""), state.get("crew_outputs", []),
+                          state.get("critiques", []), state.get("accepted", True),
+                          state.get("quality_score"))
+    return {}
+
+
+def decide(state: AgentState) -> dict[str, Any]:
+    """Nœud DÉCIDER : Hermes juge si un nouveau tour ajoute de la valeur
+    (au lieu d'un `keep_going=True` aveugle). Réinitialise l'état de reprise
+    pour la prochaine boucle complète. Hermes off => True (comme avant)."""
+    from ultimate_agent.core import hermes_director
+
+    iteration = state.get("iteration", 0) + 1
+    keep = hermes_director.should_continue({**state, "iteration": iteration})
+    return {"iteration": iteration, "keep_going": keep,
+            "redo_count": 0, "redo_tasks": []}
+
+
+def route_after_decide(state: AgentState) -> str:
+    """Arête conditionnelle finale : boucler ou s'arrêter."""
+    return "loop" if state.get("keep_going", True) else "end"
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Compilation du graphe (lazy : compile une seule fois)
+# ──────────────────────────────────────────────────────────────────────
+
+_compiled = None
+
+
+def build_brain():
+    """Construit et compile le `StateGraph` LangGraph."""
+    graph = StateGraph(AgentState)
+    graph.add_node("perceive", perceive)
+    graph.add_node("plan", plan)
+    graph.add_node("delegate", delegate)
+    graph.add_node("critique", critique)
+    graph.add_node("gate", gate)          # ← directeur Hermes : ferme la boucle qualité
+    graph.add_node("memorize", memorize)
+    graph.add_node("decide", decide)
+
+    graph.add_edge(START, "perceive")
+    graph.add_edge("perceive", "plan")
+    graph.add_edge("plan", "delegate")
+    graph.add_edge("delegate", "critique")
+    graph.add_edge("critique", "gate")
+    # Le gate décide : REPRENDRE (retour delegate avec tâches correctives) ou continuer.
+    graph.add_conditional_edges(
+        "gate", route_after_critique, {"redo": "delegate", "ok": "memorize"}
+    )
+    graph.add_edge("memorize", "decide")
+    graph.add_conditional_edges(
+        "decide", route_after_decide, {"loop": "perceive", "end": END}
+    )
+    return graph.compile()
+
+
+def get_brain():
+    """Retourne le graphe compilé (singleton)."""
+    global _compiled
+    if _compiled is None:
+        _compiled = build_brain()
+    return _compiled
