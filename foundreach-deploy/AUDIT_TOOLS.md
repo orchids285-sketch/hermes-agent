@@ -45,9 +45,20 @@ NAME `n8n` is in **15 files** → it IS connected (via other config). The env-va
 positives — hence the deep verification. Thin tools (1 file: OpenSEO, SerpBear, Ballerine, Postiz, Plane,
 Cal.com, AFFiNE, Landing-agent) were spot-checked = **real** env reads, not stubs. ✅
 
-**Bottom line:** aside from **Agno** + **Hermes** (now wired), the extra organs you gave to strengthen the
-autopilot — **Letta, Huginn, Mautic, Onyx, PipesHub, Eigent** — are NOT connected to it. Frappe was swapped
-for Twenty.
+**Bottom line (at audit time):** aside from **Agno** + **Hermes**, the extra organs you gave — **Letta,
+Huginn, Mautic, Onyx, PipesHub, Eigent** — were NOT connected. Frappe was swapped for Twenty.
+
+## ✅ RESOLUTION — all 6 orphans now CONNECTED in code (see `organs/`)
+| Organ | Wired into | State |
+|---|---|---|
+| **Letta** | `prospect_memory` (semantic long-term memory) | ✅ wired + tested; fully configured |
+| **Mautic** | `twenty_direct.sync_signal` (contact → nurture) | ✅ wired + tested; add `MAUTIC_USER`/`PASSWORD` |
+| **Huginn** | `automation_runner` (fired automation → event) | ✅ wired + tested; add `HUGINN_WEBHOOK_URL` |
+| **Eigent** | `agent_graph` tool `consult_eigent` | ✅ wired + tested; set `EIGENT_URL`(+key) |
+| **Onyx** | `agent_graph` tool `search_knowledge` (RAG) | ✅ wired + tested; **deploy** + set `ONYX_URL` |
+| **PipesHub** | `agent_graph` tool `search_knowledge` | ✅ wired + tested; **deploy** + set `PIPESHUB_URL` |
+All AUGMENT (never replace) + GRACEFUL (organ unset/down => no-op, host path unaffected) + syntax-checked.
+Nothing lights up / breaks anything until its env is set — so it's safe to ship as-is.
 
 **In plain terms:** besides **Agno** (and now **Hermes**), the agent organs you gave to make the
 autopilot smarter — **Letta, Onyx, PipesHub, Eigent** — are NOT connected to it. They were
