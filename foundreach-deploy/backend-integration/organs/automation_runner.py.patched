@@ -1,0 +1,92 @@
+"""automation_runner.py — the autonomous tick that makes saved automations
+actually RUN by themselves.
+
+This is the piece that turns a saved prompt into a real 24/7 agent (the thing
+Lindy does): every minute the scheduler calls run_once(); any automation whose
+next_run_at is due fires through the agent - in operator mode when configured,
+so it can ACT through the user's connected tools, not just answer - then
+reschedules itself from its own cron.
+
+Registered in services/phantom_scheduler.start().
+"""
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from lib.db import db_execute, db_query
+from lib.logger import get_logger
+
+log = get_logger()
+
+
+def run_once() -> dict[str, Any]:
+    """Fire every due automation once. Best-effort; never raises."""
+    now = datetime.now(timezone.utc)
+    try:
+        due = db_query(
+            "SELECT id, user_id, prompt, cron, operator_mode "
+            "FROM agent_automations "
+            "WHERE enabled = true "
+            "  AND next_run_at IS NOT NULL AND next_run_at <= now() "
+            "ORDER BY next_run_at ASC LIMIT 10") or []
+    except Exception as e:  # column may not exist yet on a cold DB
+        log.warning("[auto_runner] due query: %s", str(e)[:160])
+        return {"due": 0, "errors": 1}
+
+    if not due:
+        return {"due": 0, "fired": 0}
+
+    # Import the agent lazily to avoid a circular import at module load.
+    try:
+        from routers.agent import AgentRun, _cron_next
+        from routers.agent import run as agent_run
+    except Exception as e:
+        log.warning("[auto_runner] agent import: %s", str(e)[:160])
+        return {"due": len(due), "errors": 1}
+
+    fired = 0
+    for a in due:
+        aid = a.get("id")
+        try:
+            agent_run(AgentRun(
+                user_id=a["user_id"],
+                prompt=a["prompt"],
+                operator_mode=bool(a.get("operator_mode")),
+            ))
+            # Fan the automation event out to Huginn (event-driven organ) — graceful:
+            # no-op unless HUGINN_WEBHOOK_URL is configured; never affects the run.
+            try:
+                from lib import huginn_client
+                huginn_client.emit_event({"type": "automation_fired", "automation_id": aid,
+                                          "user_id": a.get("user_id"),
+                                          "prompt": str(a.get("prompt"))[:200]})
+            except Exception:
+                pass
+            nxt = _cron_next(a.get("cron"), now)
+            # If the cron is one-shot / invalid, disable rather than hot-loop.
+            if nxt is None:
+                db_execute(
+                    "UPDATE agent_automations "
+                    "SET last_run_at = now(), next_run_at = NULL, enabled = false "
+                    "WHERE id = %s", [aid])
+            else:
+                db_execute(
+                    "UPDATE agent_automations "
+                    "SET last_run_at = now(), next_run_at = %s WHERE id = %s",
+                    [nxt, aid])
+            fired += 1
+            log.info("[auto_runner] fired %s (operator=%s)",
+                     aid, bool(a.get("operator_mode")))
+        except Exception as e:  # noqa: BLE001
+            log.warning("[auto_runner] fire %s: %s", aid, str(e)[:160])
+            # Back off an hour so one broken automation can't spin the worker.
+            try:
+                backoff = now + timedelta(hours=1)
+                db_execute(
+                    "UPDATE agent_automations SET next_run_at = %s WHERE id = %s",
+                    [backoff, aid])
+            except Exception:
+                pass
+
+    return {"due": len(due), "fired": fired}

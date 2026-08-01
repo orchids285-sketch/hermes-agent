@@ -1,0 +1,464 @@
+"""Direct Postgres insertion into Twenty's workspace schema.
+
+We share the same Postgres instance as Twenty (both on the same Railway
+project), so we can write Person/Company/Note rows DIRECTLY without
+needing a Twenty API token. This bypasses the API auth requirement
+entirely — the user doesn't have to generate anything.
+
+Auto-discovers:
+  - the workspace schema name (workspace_xxxxx)
+  - the AURION AI workspace member id (used as createdByWorkspaceMemberId)
+
+Idempotent: dedup by email (people) and by domain (companies).
+"""
+from __future__ import annotations
+import re
+import uuid
+from typing import Any
+
+
+from storage.db import get_pool
+from lib.logger import get_logger
+
+log = get_logger()
+
+
+_state: dict[str, str | None] = {
+    "schema": None,
+    "member_id": None,
+    "created_by_source": None,  # 'SYSTEM' | 'API' | first valid enum value
+}
+
+
+def _resolve_schema() -> str | None:
+    """Find the Twenty workspace schema (workspace_xxxxx)."""
+    if _state["schema"]:
+        return _state["schema"]
+    with get_pool().connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT table_schema FROM information_schema.tables "
+            "WHERE table_schema LIKE 'workspace_%' "
+            "AND table_name = 'person' LIMIT 1"
+        )
+        row = cur.fetchone()
+    _state["schema"] = row[0] if row else None
+    return _state["schema"]
+
+
+def _resolve_member_id(schema: str) -> str | None:
+    """First workspace member — used as the 'creator' for audit fields."""
+    if _state["member_id"]:
+        return _state["member_id"]
+    with get_pool().connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f'SELECT id FROM "{schema}"."workspaceMember" WHERE "deletedAt" IS NULL LIMIT 1'
+        )
+        row = cur.fetchone()
+    _state["member_id"] = str(row[0]) if row else None
+    return _state["member_id"]
+
+
+def _resolve_source_value(schema: str) -> str:
+    """Twenty's createdBySource is a per-table enum. Pick a valid value."""
+    if _state["created_by_source"]:
+        return _state["created_by_source"]
+    with get_pool().connection() as conn, conn.cursor() as cur:
+        # Read an existing row's source (always valid)
+        cur.execute(f'SELECT "createdBySource"::text FROM "{schema}"."person" LIMIT 1')
+        row = cur.fetchone()
+        if row and row[0]:
+            _state["created_by_source"] = row[0]
+            return row[0]
+    _state["created_by_source"] = "SYSTEM"
+    return "SYSTEM"
+
+
+def is_configured() -> bool:
+    """Direct mode is always available as long as Postgres is reachable
+    and a workspace schema exists."""
+    return _resolve_schema() is not None
+
+
+# Domains that aren't real fetchable websites (API endpoints, gov data sources,
+# paths, single words) make the embedded Twenty's twenty-icons.com logo fetch 400.
+# Drop them at the source so a bad company domain is NEVER stored again.
+_BAD_DOMAIN_RE = re.compile(r"(^|\.)api\.|\.gouv\.|[\s/]|\.local$|^[^.]+$", re.I)
+
+
+def _sanitize_domain(d: str) -> str:
+    d = (d or "").strip().lower().rstrip("/")
+    return "" if (not d or _BAD_DOMAIN_RE.search(d)) else d
+
+
+def _domain_from(url: str, email: str) -> str:
+    d = ""
+    if email and "@" in email:
+        d = email.rsplit("@", 1)[-1].lower()
+    elif url:
+        m = re.search(r"https?://(?:www\.)?([^/]+)", url)
+        if m:
+            d = m.group(1).lower().rstrip("/")
+    return _sanitize_domain(d)
+
+
+def _next_position(schema: str, table: str, cur) -> float:
+    cur.execute(f'SELECT COALESCE(MAX(position), 0) + 1 FROM "{schema}"."{table}"')
+    return float(cur.fetchone()[0] or 1)
+
+
+# ---------------------------------------------------------------------------
+# PERSON
+# ---------------------------------------------------------------------------
+
+
+def _find_person_by_email(cur, schema: str, email: str) -> str | None:
+    cur.execute(
+        f'SELECT id FROM "{schema}"."person" '
+        f'WHERE LOWER("emailsPrimaryEmail") = LOWER(%s) AND "deletedAt" IS NULL LIMIT 1',
+        (email,),
+    )
+    row = cur.fetchone()
+    return str(row[0]) if row else None
+
+
+def _find_person_by_x(cur, schema: str, twitter_handle: str) -> str | None:
+    """Reddit usernames go into the xLinkPrimaryLinkUrl field as a profile URL —
+    we dedup against that so the same reddit user doesn't get inserted twice."""
+    if not twitter_handle:
+        return None
+    pattern = f"%/{twitter_handle.lower().lstrip('@')}"
+    cur.execute(
+        f'SELECT id FROM "{schema}"."person" '
+        f'WHERE LOWER("xLinkPrimaryLinkUrl") LIKE %s AND "deletedAt" IS NULL LIMIT 1',
+        (pattern,),
+    )
+    row = cur.fetchone()
+    return str(row[0]) if row else None
+
+
+def _find_company_by_domain(cur, schema: str, domain: str) -> str | None:
+    if not domain:
+        return None
+    cur.execute(
+        f'SELECT id FROM "{schema}"."company" '
+        f'WHERE LOWER("domainNamePrimaryLinkUrl") = LOWER(%s) AND "deletedAt" IS NULL LIMIT 1',
+        (domain,),
+    )
+    row = cur.fetchone()
+    return str(row[0]) if row else None
+
+
+def upsert_company(signal: dict[str, Any]) -> str | None:
+    schema = _resolve_schema()
+    if not schema:
+        return None
+    member_id = _resolve_member_id(schema)
+    source_val = _resolve_source_value(schema)
+
+    website = signal.get("company_website") or ""
+    name = signal.get("company_name") or ""
+    domain = _domain_from(website, signal.get("email", "") or signal.get("author_email", ""))
+    if not name and not domain:
+        return None
+    import psycopg
+    with get_pool().connection() as conn, conn.cursor() as cur:
+        existing = _find_company_by_domain(cur, schema, domain)
+        if existing:
+            return existing
+        new_id = str(uuid.uuid4())
+        pos = _next_position(schema, "company", cur)
+        try:
+            cur.execute(
+                f'''INSERT INTO "{schema}"."company" (
+                      id, "createdAt", "updatedAt", name,
+                      "domainNamePrimaryLinkUrl", "domainNamePrimaryLinkLabel",
+                      position, "createdBySource", "createdByName", "createdByWorkspaceMemberId",
+                      "updatedBySource", "updatedByName", "updatedByWorkspaceMemberId",
+                      "idealCustomerProfile"
+                    ) VALUES (
+                      %s, now(), now(), %s,
+                      %s, %s,
+                      %s, %s::"{schema}"."company_createdBySource_enum", %s, %s,
+                      %s::"{schema}"."company_updatedBySource_enum", %s, %s,
+                      FALSE
+                    )''',
+                (new_id, name or domain, domain or None, domain or None, pos,
+                 source_val, "FoundReach Agent", member_id,
+                 source_val, "FoundReach Agent", member_id),
+            )
+            return new_id
+        except psycopg.errors.UniqueViolation:
+            # Race condition : un autre thread a inséré la company entre
+            # notre SELECT et notre INSERT. On rollback puis on re-SELECT.
+            conn.rollback()
+            with get_pool().connection() as conn2, conn2.cursor() as cur2:
+                existing = _find_company_by_domain(cur2, schema, domain)
+                return existing
+
+
+def upsert_person_from_signal(signal: dict[str, Any]) -> str | None:
+    schema = _resolve_schema()
+    if not schema:
+        return None
+    member_id = _resolve_member_id(schema)
+    source_val = _resolve_source_value(schema)
+
+    email = (signal.get("email") or signal.get("author_email") or "").lower().strip()
+    reddit_user = (signal.get("author_username") or "").lstrip("u/")
+    src = signal.get("source") or ""
+    has_linkedin = bool(signal.get("linkedin") or signal.get("linkedin_url")
+                          or (src == "linkedin" and signal.get("author_url")))
+    has_twitter = bool(src in ("twitter", "x") and signal.get("author_url"))
+    has_email = bool(email)
+    has_full_name = bool(signal.get("first_name") or signal.get("last_name"))
+    # NOISE FILTER : on ne pollue plus Twenty avec 21k usernames Reddit/HN
+    # sans aucune info actionnable. Seuls les signaux avec au moins email,
+    # LinkedIn URL, X handle, ou nom complet sont pushés comme Person.
+    if not (has_email or has_linkedin or has_twitter or has_full_name):
+        return None
+    # GUARD: enrichment sometimes drops a COMPANY/brand name into `first_name`
+    # (e.g. a lone "Budibase"), producing a contactless "person" that is really
+    # a company — the source of the junk leads. When the first name equals the
+    # signal's company name and there's no contact channel or real social
+    # handle, it's a mislabel: skip the person (the company is captured on its
+    # own object). This deliberately does NOT touch Reddit/HN username signals,
+    # whose first name is the handle, never the company.
+    _fn = (signal.get("first_name") or "").strip()
+    _cn = (signal.get("company_name") or "").strip()
+    if (_fn and _cn and _fn.lower() == _cn.lower()
+            and not signal.get("last_name")
+            and not (has_email or has_linkedin or has_twitter or reddit_user)):
+        return None
+
+    with get_pool().connection() as conn, conn.cursor() as cur:
+        if email:
+            existing = _find_person_by_email(cur, schema, email)
+            if existing:
+                return existing
+        if reddit_user and signal.get("source") == "reddit":
+            existing = _find_person_by_x(cur, schema, reddit_user)
+            if existing:
+                return existing
+
+        company_id = None
+        if signal.get("company_name") or signal.get("company_website"):
+            company_id = upsert_company(signal)
+
+        # Route each source's identity URL to its NATIVE column.
+        # Reddit / HN never touch the X (Twitter) column — that was data
+        # pollution. Their identity stays in the note body + jobTitle, and
+        # we also stamp the source_url into linkedinLink only if the
+        # signal explicitly has a LinkedIn URL from enrichment.
+        x_label = ""
+        x_url = ""
+        linkedin_url = signal.get("linkedin")
+        linkedin_label = "LinkedIn" if linkedin_url else None
+        source = signal.get("source")
+        if source in ("twitter", "x"):
+            x_label = signal.get("author_username") or ""
+            x_url = signal.get("author_url") or ""
+        elif source == "linkedin" and not linkedin_url:
+            linkedin_url = signal.get("author_url") or signal.get("linkedin_url")
+            linkedin_label = signal.get("author_username") or "LinkedIn"
+
+        first_name = (signal.get("first_name") or reddit_user or "Unknown")[:60]
+        last_name = (signal.get("last_name") or "")[:60]
+        job_title = signal.get("title_role") or signal.get("title") or "Reddit / HN user"
+        # title field on signal is the POST title; use a sensible job title default
+        if signal.get("source") in ("reddit", "hackernews"):
+            job_title = f"Active on {signal.get('source')}"
+
+        new_id = str(uuid.uuid4())
+        pos = _next_position(schema, "person", cur)
+        cur.execute(
+            f'''INSERT INTO "{schema}"."person" (
+                  id, "createdAt", "updatedAt",
+                  "nameFirstName", "nameLastName",
+                  "emailsPrimaryEmail",
+                  "linkedinLinkPrimaryLinkUrl", "linkedinLinkPrimaryLinkLabel",
+                  "xLinkPrimaryLinkUrl", "xLinkPrimaryLinkLabel",
+                  "jobTitle", "companyId",
+                  position,
+                  "createdBySource", "createdByName", "createdByWorkspaceMemberId",
+                  "updatedBySource", "updatedByName", "updatedByWorkspaceMemberId"
+                ) VALUES (
+                  %s, now(), now(),
+                  %s, %s,
+                  %s,
+                  %s, %s,
+                  %s, %s,
+                  %s, %s,
+                  %s,
+                  %s::"{schema}"."person_createdBySource_enum", %s, %s,
+                  %s::"{schema}"."person_updatedBySource_enum", %s, %s
+                )''',
+            (new_id, first_name, last_name,
+             email or None,
+             linkedin_url or None,
+             linkedin_label,
+             x_url or None, x_label or None,
+             job_title[:255], company_id,
+             pos,
+             source_val, "FoundReach Agent", member_id,
+             source_val, "FoundReach Agent", member_id),
+        )
+        return new_id
+
+
+def attach_signal_note(person_id: str, signal: dict[str, Any]) -> str | None:
+    schema = _resolve_schema()
+    if not schema or not person_id:
+        return None
+    member_id = _resolve_member_id(schema)
+    source_val = _resolve_source_value(schema)
+
+    score = signal.get("score_total", 0)
+    verdict = "HOT" if score >= 75 else "WARM" if score >= 50 else "COLD" if score >= 25 else "NOISE"
+
+    title = f"{verdict} signal · {signal.get('source')} · {score}/100"
+    body_md = (
+        f"# {verdict} buyer-intent signal — score {score}/100\n\n"
+        f"**Source:** {signal.get('source')}  \n"
+        f"**Subreddit:** r/{signal.get('subreddit')}  \n" if signal.get('subreddit') else ""
+    )
+    body_md = (
+        f"# {verdict} buyer-intent signal — score {score}/100\n\n"
+        f"**Source:** {signal.get('source')}  \n"
+        + (f"**Subreddit:** r/{signal.get('subreddit')}  \n" if signal.get('subreddit') else "")
+        + f"**Author:** {signal.get('author_username')}  \n"
+        + (f"**Posted:** {signal.get('posted_at')}  \n" if signal.get('posted_at') else "")
+        + f"**Link:** {signal.get('source_url')}\n\n"
+        + "## Score breakdown\n"
+        + f"- urgency: {signal.get('score_urgency')}/30\n"
+        + f"- intent: {signal.get('score_intent')}/30\n"
+        + f"- relevance: {signal.get('score_relevance')}/25\n"
+        + f"- freshness: {signal.get('score_freshness')}/10\n"
+        + f"- engagement: {signal.get('score_engagement')}/5\n\n"
+        + "## AI reasoning\n"
+        + f"> {signal.get('score_reasoning') or '(no reasoning generated)'}\n\n"
+        + "## Original post\n"
+        + f"**{signal.get('title') or '(no title)'}**\n\n"
+        + (signal.get("body") or "_(link post — no body)_")
+    )
+
+    with get_pool().connection() as conn, conn.cursor() as cur:
+        note_id = str(uuid.uuid4())
+        pos = _next_position(schema, "note", cur)
+        cur.execute(
+            f'''INSERT INTO "{schema}"."note" (
+                  id, "createdAt", "updatedAt", title, "bodyV2Markdown", "bodyV2Blocknote",
+                  position,
+                  "createdBySource", "createdByName", "createdByWorkspaceMemberId",
+                  "updatedBySource", "updatedByName", "updatedByWorkspaceMemberId"
+                ) VALUES (
+                  %s, now(), now(), %s, %s, %s,
+                  %s,
+                  %s::"{schema}"."note_createdBySource_enum", %s, %s,
+                  %s::"{schema}"."note_updatedBySource_enum", %s, %s
+                )''',
+            (note_id, title[:255], body_md[:5000], None,
+             pos,
+             source_val, "FoundReach Agent", member_id,
+             source_val, "FoundReach Agent", member_id),
+        )
+
+        # Link the note to the person
+        link_id = str(uuid.uuid4())
+        link_pos = _next_position(schema, "noteTarget", cur)
+        cur.execute(
+            f'''INSERT INTO "{schema}"."noteTarget" (
+                  id, "createdAt", "updatedAt", "noteId", "targetPersonId",
+                  position,
+                  "createdBySource", "createdByName", "createdByWorkspaceMemberId",
+                  "updatedBySource", "updatedByName", "updatedByWorkspaceMemberId"
+                ) VALUES (
+                  %s, now(), now(), %s, %s,
+                  %s,
+                  %s::"{schema}"."noteTarget_createdBySource_enum", %s, %s,
+                  %s::"{schema}"."noteTarget_updatedBySource_enum", %s, %s
+                )''',
+            (link_id, note_id, person_id, link_pos,
+             source_val, "FoundReach Agent", member_id,
+             source_val, "FoundReach Agent", member_id),
+        )
+    return note_id
+
+
+def sync_signal(signal: dict[str, Any]) -> tuple[str | None, str | None]:
+    """High-level helper: ensure Person + attach Note. Returns (person_id, note_id)."""
+    try:
+        person_id = upsert_person_from_signal(signal)
+        note_id = attach_signal_note(person_id, signal) if person_id else None
+        # Also enter the contact into Mautic's marketing-automation (nurture) — graceful:
+        # no-op if Mautic isn't configured, and it never affects the Twenty result above.
+        try:
+            email = (signal.get("author_email") or signal.get("email") or "").strip()
+            if email:
+                from lib import mautic_client
+                name = (signal.get("author_name") or signal.get("author_username") or "").strip()
+                mautic_client.upsert_contact(
+                    email, first=(name.split(" ")[0] or None),
+                    company=(signal.get("company_name") or signal.get("company") or None),
+                    tags=["foundreach", str(signal.get("source") or "signal")])
+        except Exception:
+            pass
+        return person_id, note_id
+    except Exception as e:
+        log.exception("twenty_direct sync failed for %s: %s", signal.get("source_id"), e)
+        return None, None
+
+
+def twenty_workspace_url() -> str | None:
+    """Return https://<subdomain>.twenty.com or our self-hosted Twenty URL."""
+    import os
+    base = os.environ.get("TWENTY_API_URL", "").rstrip("/")
+    return base or None
+
+
+def list_known_emails(limit: int = 2000) -> list[str]:
+    """Return all already-known emails in the Twenty workspace — used by
+    push_replay to dedup BEFORE pushing. Without this we'd re-push the same
+    prospects every run."""
+    schema = _resolve_schema()
+    if not schema:
+        return []
+    try:
+        from storage.db import get_pool
+        with get_pool().connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                f'SELECT "emails"->\'primaryEmail\' AS e '
+                f'FROM "{schema}"."person" '
+                f'WHERE "deletedAt" IS NULL '
+                f'  AND "emails"->\'primaryEmail\' IS NOT NULL '
+                f'LIMIT %s', [max(1, min(limit, 10_000))])
+            out = []
+            for row in cur.fetchall():
+                v = row[0]
+                if isinstance(v, str) and "@" in v:
+                    out.append(v.strip().lower())
+            return out
+    except Exception:
+        return []
+
+
+def list_known_linkedin_handles(limit: int = 2000) -> list[str]:
+    """Same for LinkedIn handles — letter-of-`/in/<handle>`."""
+    schema = _resolve_schema()
+    if not schema:
+        return []
+    try:
+        from storage.db import get_pool
+        with get_pool().connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                f'SELECT "linkedinLink"->\'primaryLinkUrl\' AS u '
+                f'FROM "{schema}"."person" WHERE "deletedAt" IS NULL '
+                f'LIMIT %s', [max(1, min(limit, 10_000))])
+            out = []
+            for row in cur.fetchall():
+                v = row[0]
+                if isinstance(v, str) and "/in/" in v:
+                    h = v.split("/in/")[-1].strip("/").split("/")[0].lower()
+                    if h: out.append(h)
+            return out
+    except Exception:
+        return []
