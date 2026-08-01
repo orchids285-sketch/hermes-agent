@@ -133,9 +133,35 @@ if ork: hermes_env["OPENROUTER_API_KEY"] = ork
 hermes_dom = create_service("hermes-agent", HERMES_REPO, 8642, hermes_env, "/opt/data")
 
 # ── 3. ego-web ──────────────────────────────────────────────────────────────────────
+# The browser is useless deployed alone: without EGO_LLM_KEY its agent cannot think, and
+# without FR_API_URL the bridge home is dead (no API-first, no company knowledge, no audit).
+# Both are wired here so payment day needs no second pass.
 print("[3/5] deploying ego-web (browser for AI agents)")
-ego_dom = create_service("ego-web", EGOWEB_REPO, 8080,
-                         {"EGO_API_KEY": EGO_KEY, "EGO_DATA_DIR": "/data", "EGO_HEADLESS": "1"}, "/data")
+
+
+def public_domain(service_id):
+    r = gql('query($s:String!,$e:String!){ serviceInstance(serviceId:$s, environmentId:$e){'
+            ' domains{ serviceDomains{ domain } customDomains{ domain } } } }',
+            {"s": service_id, "e": ENVV})
+    d = (((r.get("data") or {}).get("serviceInstance") or {}).get("domains") or {})
+    for key in ("customDomains", "serviceDomains"):
+        for row in (d.get(key) or []):
+            if row.get("domain"):
+                return row["domain"]
+    return None
+
+
+backend_dom = public_domain(bid) if bid else None
+backend_url = os.environ.get("FR_API_URL") or (f"https://{backend_dom}" if backend_dom else "")
+print("  backend url for the bridge:", backend_url or "(unknown — set FR_API_URL to enable it)")
+
+ego_env = {"EGO_API_KEY": EGO_KEY, "EGO_DATA_DIR": "/data", "EGO_HEADLESS": "1",
+           "EGO_EMBED_OPEN": "0", "EGO_FRAME_ANCESTORS": f"'self' {CORS}"}
+if ork:
+    ego_env["EGO_LLM_KEY"] = ork                    # the loop needs a model to reason with
+if backend_url:
+    ego_env["FR_API_URL"] = backend_url             # API-first + knowledge + audit + spine
+ego_dom = create_service("ego-web", EGOWEB_REPO, 8080, ego_env, "/data")
 
 # ── 3b. Onyx knowledge stack (OPT-IN: `--with-knowledge`) ───────────────────────────
 # Onyx is a 7-service stack (postgres, redis, opensearch, minio, model-server, backend,
