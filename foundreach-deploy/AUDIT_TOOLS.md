@@ -17,14 +17,37 @@ Twenty (CRM), Plane (tasks), Postiz (social), Docmost/AFFiNE (docs), Suna (Growt
 Onlook (Studio), Billix (employee), Chatwoot (support), Sim Studio, Ycode (creatives), Cal.com,
 AppFlowy — all wired in `EmbedViews.tsx` / `GrowthViews.tsx` / `MiscViews.tsx` (~20 embeds, wl-* proxies).
 
-## 🚩 GIVEN BUT NOT CONNECTED (this is the real gap — validates your suspicion)
-| Tool | Files | Verdict |
-|---|---|---|
-| **Letta** | **0** | Deployed as an "ultra-employee organ" but ZERO references anywhere. Orphaned. |
-| **Onyx** | **0** | ZERO references. Orphaned. |
-| **PipesHub** | **0** | Deployed per notes, ZERO references. Orphaned. |
-| **Eigent** (eigent-brain) | 3 (frontend only) | Shown as an **iframe embed** (`EmbedViews`, `GhostOverlay`) — its "brain" is **NOT wired to the autopilot**. It directs nothing. |
-| **Frappe CRM** | **0** | Absent — **replaced by Twenty**. (You warned: "pas remplacer".) |
+## 🚩 GIVEN BUT NOT CONNECTED (the real gap — validates your suspicion)
+DEEP method: not just ref-counts — checked whether each tool's **configured env vars are actually
+READ** by code (set-but-never-read = dead config = orphan) AND whether the tool NAME appears anywhere.
+
+| Tool | Config in env | Used in code | Verdict |
+|---|---|---|---|
+| **Letta** (memory organ) | `LETTA_BASE_URL`+`LETTA_TOKEN`+`LETTA_MODEL`+`LETTA_EMBEDDING` (full) | **0** | Fully configured, **never read**. Orphan. |
+| **Huginn** (automation agent) | `HUGINN_URL` | **0** | Configured, **never read**. Orphan. |
+| **Mautic** (marketing automation) | `MAUTIC_API_URL` | **0** | Configured, **never read**. Orphan. |
+| **Onyx** (enterprise/RAG search) | — | **0** | Absent everywhere. Orphan. |
+| **PipesHub** (knowledge search) | — | **0** | Absent everywhere. Orphan. |
+| **Eigent** (multi-agent brain) | `RAILWAY_SERVICE_EIGENT_BRAIN_URL` | 3 (frontend iframe only) | Shown as an embed; its brain **NOT wired to the autopilot**. Directs nothing. |
+| **Frappe CRM** | — | **0** | Absent — **replaced by Twenty** (you warned: "pas remplacer"). |
+
+**(Convex is NOT an orphan — the deep pass found it used in `backend/birch/*` (5 files), i.e. it backs Birch/Billix. Corrected.)**
+
+## Completeness (this was exhaustive, not 5-6 tools)
+Cross-checked **40+ tools from memory**, **199 env keys**, and **all 50 deployed Railway services**.
+Deployed services confirmed USED: ansvisor (14), creatives (15), searxng (13), crawlee (8), meilisearch (8),
+obscura (6), mirofish (5), convex (5), browser-worker (5), livekit (3), temporal (2). Only **huginn=0**
+among services (orphan). So the FINAL orphan set = **Letta, Huginn, Mautic, Onyx, PipesHub** (fully) +
+**Eigent** (embed-only) + **Frappe** (replaced). Everything else is genuinely connected.
+
+**CORRECTION from the deep pass:** `n8n` looked orphaned by env-var (`N8N_WEBHOOK_URL`=0 reads) but the
+NAME `n8n` is in **15 files** → it IS connected (via other config). The env-var check alone gives false
+positives — hence the deep verification. Thin tools (1 file: OpenSEO, SerpBear, Ballerine, Postiz, Plane,
+Cal.com, AFFiNE, Landing-agent) were spot-checked = **real** env reads, not stubs. ✅
+
+**Bottom line:** aside from **Agno** + **Hermes** (now wired), the extra organs you gave to strengthen the
+autopilot — **Letta, Huginn, Mautic, Onyx, PipesHub, Eigent** — are NOT connected to it. Frappe was swapped
+for Twenty.
 
 **In plain terms:** besides **Agno** (and now **Hermes**), the agent organs you gave to make the
 autopilot smarter — **Letta, Onyx, PipesHub, Eigent** — are NOT connected to it. They were
