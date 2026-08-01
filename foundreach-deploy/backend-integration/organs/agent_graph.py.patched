@@ -218,13 +218,36 @@ def _tools(user_id: str) -> list[Any]:
             log.info("agent tool consult_eigent failed: %s", str(e)[:120])
             return "Eigent hit a snag; proceed yourself."
 
+    @tool
+    def search_knowledge(query: str) -> str:
+        """Search the company's internal knowledge base + documents (Onyx RAG / PipesHub) for
+        grounded facts before answering. `query` = what to look up. Returns the best answer or
+        snippets, or a note that nothing was found."""
+        try:
+            from lib import onyx_client, pipeshub_client
+            a = onyx_client.answer(query) if onyx_client.is_configured() else ""
+            if a:
+                return a[:1200]
+            hits = (onyx_client.search(query, 4) if onyx_client.is_configured() else []) + \
+                   (pipeshub_client.search(query, 4) if pipeshub_client.is_configured() else [])
+            return "\n".join("- " + h[:200] for h in hits[:5]) or "No internal knowledge found."
+        except Exception as e:  # noqa: BLE001
+            log.info("agent tool search_knowledge failed: %s", str(e)[:120])
+            return "knowledge search hit a snag."
+
     tools = [hunt, draft_openers, draft_followups, do_action, operate, browse]
-    # Eigent multi-agent brain — only offered as a tool when it's actually configured,
-    # so the agent isn't tempted to call a dead organ.
+    # Extra organs — offered as tools ONLY when actually configured, so the agent never
+    # calls a dead organ. Each is graceful internally too.
     try:
         from lib import eigent_client
         if eigent_client.is_configured():
             tools.append(consult_eigent)
+    except Exception:
+        pass
+    try:
+        from lib import onyx_client, pipeshub_client
+        if onyx_client.is_configured() or pipeshub_client.is_configured():
+            tools.append(search_knowledge)
     except Exception:
         pass
     return tools
