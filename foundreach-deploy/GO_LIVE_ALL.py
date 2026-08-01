@@ -68,9 +68,36 @@ def upsert_env(sid, variables):
     return gql('mutation($i:VariableCollectionUpsertInput!){ variableCollectionUpsert(input:$i) }',
                {"i": {"projectId": PROJECT, "environmentId": ENVV, "serviceId": sid, "variables": variables}})
 
+def create_from_image(name, image, env=None, port=None, mount=None, deploy=True):
+    """Provision a service from a public Docker image (used for the Onyx stack)."""
+    if name in SVC:
+        print("  %s exists — reusing" % name); sid = SVC[name]
+    else:
+        r = gql('mutation($i:ServiceCreateInput!){ serviceCreate(input:$i){ id } }',
+                {"i": {"projectId": PROJECT, "name": name, "source": {"image": image}}})
+        if blocked(r): print("  BLOCKED creating", name); return None, None
+        sid = (r.get("data") or {}).get("serviceCreate", {}).get("id")
+        print("  created %s (%s)" % (name, image))
+    if not sid: return None, None
+    SVC[name] = sid
+    if env: upsert_env(sid, env)
+    if mount:
+        gql('mutation($i:VolumeCreateInput!){ volumeCreate(input:$i){ id } }',
+            {"i": {"projectId": PROJECT, "environmentId": ENVV, "serviceId": sid, "mountPath": mount}})
+    dom = None
+    if port:
+        d = gql('mutation($i:ServiceDomainCreateInput!){ serviceDomainCreate(input:$i){ domain } }',
+                {"i": {"environmentId": ENVV, "serviceId": sid, "targetPort": port}})
+        dom = (d.get("data") or {}).get("serviceDomainCreate", {}).get("domain")
+    if deploy:
+        gql('mutation($s:String!,$e:String!){ serviceInstanceDeployV2(serviceId:$s, environmentId:$e) }',
+            {"s": sid, "e": ENVV})
+    return sid, dom
+
+
 def create_service(name, repo, port, env, mount):
     if name in SVC:
-        print("  %s already exists (%s) — reusing" % (name, SVC[name])); sid = SVC[name]
+        print("  %s already exists — reusing" % name); sid = SVC[name]
     else:
         r = gql('mutation($i:ServiceCreateInput!){ serviceCreate(input:$i){ id } }',
                 {"i": {"projectId": PROJECT, "name": name, "source": {"repo": repo}}})
@@ -110,6 +137,39 @@ print("[3/5] deploying ego-web (browser for AI agents)")
 ego_dom = create_service("ego-web", EGOWEB_REPO, 8080,
                          {"EGO_API_KEY": EGO_KEY, "EGO_DATA_DIR": "/data", "EGO_HEADLESS": "1"}, "/data")
 
+# ── 3b. Onyx knowledge stack (OPT-IN: `--with-knowledge`) ───────────────────────────
+# Onyx is a 7-service stack (postgres, redis, opensearch, minio, model-server, backend,
+# web-server). That is a REAL monthly cost, so it is never provisioned silently — pass the
+# flag when you actually want it. Images are the official ones from Onyx's compose.
+onyx_dom = None
+if "--with-knowledge" in sys.argv:
+    print("[3b] deploying the Onyx knowledge stack (opt-in — this adds real monthly cost)")
+    pg_pass = os.environ.get("ONYX_PG_PASSWORD", "onyx_" + os.urandom(8).hex())
+    create_from_image("onyx-postgres", "postgres:15.2-alpine",
+                      {"POSTGRES_USER": "postgres", "POSTGRES_PASSWORD": pg_pass, "POSTGRES_DB": "postgres"},
+                      mount="/var/lib/postgresql/data")
+    create_from_image("onyx-redis", "redis:7.4-alpine")
+    create_from_image("onyx-opensearch", "opensearchproject/opensearch:3.6.0",
+                      {"discovery.type": "single-node", "DISABLE_SECURITY_PLUGIN": "true",
+                       "OPENSEARCH_JAVA_OPTS": "-Xms1g -Xmx1g"}, mount="/usr/share/opensearch/data")
+    create_from_image("onyx-minio", "minio/minio:RELEASE.2025-07-23T15-54-02Z-cpuv1",
+                      {"MINIO_ROOT_USER": "onyxadmin", "MINIO_ROOT_PASSWORD": pg_pass}, mount="/data")
+    create_from_image("onyx-model-server", "onyxdotapp/onyx-model-server:latest")
+    shared = {
+        "POSTGRES_HOST": "onyx-postgres.railway.internal", "POSTGRES_USER": "postgres",
+        "POSTGRES_PASSWORD": pg_pass, "POSTGRES_DB": "postgres",
+        "REDIS_HOST": "onyx-redis.railway.internal",
+        "OPENSEARCH_HOST": "onyx-opensearch.railway.internal",
+        "MODEL_SERVER_HOST": "onyx-model-server.railway.internal",
+        "S3_ENDPOINT_URL": "http://onyx-minio.railway.internal:9000",
+        "S3_AWS_ACCESS_KEY_ID": "onyxadmin", "S3_AWS_SECRET_ACCESS_KEY": pg_pass,
+        "AUTH_TYPE": "disabled",
+    }
+    _, onyx_dom = create_from_image("onyx-backend", "onyxdotapp/onyx-backend:latest", shared, port=8080)
+    create_from_image("onyx-web", "onyxdotapp/onyx-web-server:latest",
+                      {"INTERNAL_URL": "http://onyx-backend.railway.internal:8080"}, port=3000)
+    print("  onyx api:", onyx_dom)
+
 # ── 4. wire the backend to every organ that exists ──────────────────────────────────
 print("[4/5] wiring the backend")
 if bid:
@@ -123,6 +183,8 @@ if bid:
         wire["EGO_WEB_KEY"] = EGO_KEY
     # organs already deployed on the fleet (URLs known from the audit)
     wire.setdefault("EIGENT_URL", "https://eigent-brain-production.up.railway.app")
+    if onyx_dom:
+        wire["ONYX_URL"] = "https://%s" % onyx_dom     # lights up agent_graph's search_knowledge tool
     if wire:
         upsert_env(bid, wire)
         print("  set on backend:", ", ".join(sorted(wire)))
@@ -141,9 +203,12 @@ print("\n================ LIVE ================")
 if hermes_dom: print(" Hermes  : https://%s/v1   (Bearer %s)" % (hermes_dom, HERMES_KEY))
 if ego_dom:    print(" ego-web : https://%s/?key=%s   (viewer)" % (ego_dom, EGO_KEY))
 print(" Backend : redeployed with the Hermes director + 6 organs wired")
+if onyx_dom: print(" Onyx    : https://%s   (knowledge/RAG -> search_knowledge tool armed)" % onyx_dom)
 print("\n=========== STILL NEEDS A HUMAN ===========")
-print(" • Mautic  : create an API user -> set MAUTIC_USER + MAUTIC_PASSWORD")
-print(" • Huginn  : create a Webhook Agent -> set HUGINN_WEBHOOK_URL")
-print(" • Onyx / PipesHub : multi-service stacks (see DEPLOY_onyx_pipeshub.md) -> ONYX_URL / PIPESHUB_URL")
+print(" • Mautic  : create an API user in Mautic -> set MAUTIC_USER + MAUTIC_PASSWORD")
+print(" • Huginn  : create a Webhook Agent in Huginn -> set HUGINN_WEBHOOK_URL")
+if not onyx_dom:
+    print(" • Onyx    : re-run with --with-knowledge to provision the 7-service stack (real monthly cost)")
+print(" • PipesHub: overlaps Onyx; only worth it if you want BOTH (set PIPESHUB_URL)")
 print(" • ego-web wants >=2GB RAM (Chromium OOMs below that)")
 print(" Everything else is live. Each unset organ stays a graceful no-op — nothing breaks.")
