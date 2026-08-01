@@ -1,0 +1,237 @@
+"""prospect_memory — per-prospect long-term memory layer.
+
+Inspired by mem0 (https://github.com/mem0ai/mem0 — 48k★ MIT) — the
+"extract facts → store → retrieve relevant" pattern — but built on our
+existing Postgres + LLM so we avoid pulling Qdrant/Chromadb/etc.
+
+Each prospect gets an append-only `prospect_memory` row stream:
+
+  user_id · person_id · fact · category · source · created_at
+
+`category` is one of:
+  - pain          (the prospect explicitly named a pain)
+  - budget        (price / spend / cost they revealed)
+  - timeline      (when they need to decide)
+  - stakeholder   (who else is in the loop)
+  - tool          (what they currently use / replaced / hate)
+  - quote         (their literal words we should mirror back)
+  - objection     (a concern they raised)
+  - commitment    (a yes/maybe/promise they made)
+  - relationship  (personal hooks: hometown, conference, mutual contact)
+
+Public API:
+  - remember(user_id, person_id, fact, category, source) → 1 row
+  - extract_from_reply(reply_body, ...) → calls LLM, persists N facts
+  - recall(user_id, person_id, max_per_cat=3) → grouped dict for prompts
+  - recall_summary(user_id, person_id) → 200-char bullet list for LLM
+"""
+from __future__ import annotations
+import json
+from typing import Any, Literal
+
+from lib.db import db_execute, db_query
+from lib.llm import generate_json
+from lib.logger import get_logger
+
+log = get_logger()
+
+
+Category = Literal[
+    "pain", "budget", "timeline", "stakeholder",
+    "tool", "quote", "objection", "commitment", "relationship",
+]
+CATEGORIES: tuple[Category, ...] = (
+    "pain", "budget", "timeline", "stakeholder",
+    "tool", "quote", "objection", "commitment", "relationship",
+)
+
+
+def _ensure_table() -> None:
+    try:
+        db_execute("""
+          CREATE TABLE IF NOT EXISTS prospect_memory (
+            id          BIGSERIAL PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            person_id   TEXT NOT NULL,
+            fact        TEXT NOT NULL,
+            category    TEXT NOT NULL,
+            source      TEXT,
+            confidence  INT DEFAULT 80,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+          )
+        """)
+        db_execute(
+            "CREATE INDEX IF NOT EXISTS prospect_memory_lookup "
+            "ON prospect_memory (user_id, person_id, category, created_at DESC)"
+        )
+    except Exception as e:
+        log.debug(f"ensure prospect_memory: {e}")
+
+
+def remember(user_id: str, person_id: str, fact: str,
+              category: Category, *, source: str | None = None,
+              confidence: int = 80) -> int | None:
+    """Persist a single fact. Returns row id, or None on failure."""
+    _ensure_table()
+    if category not in CATEGORIES:
+        log.warning(f"prospect_memory: invalid category {category}")
+        return None
+    fact = (fact or "").strip()
+    if not fact or len(fact) > 400:
+        return None
+    # Cheap dedup: don't insert if we already have this exact fact for
+    # this person in this category in the last 30 days.
+    try:
+        existing = db_query(
+            "SELECT id FROM prospect_memory "
+            " WHERE user_id = %s AND person_id = %s AND category = %s "
+            "   AND lower(fact) = lower(%s) "
+            "   AND created_at >= now() - interval '30 days' LIMIT 1",
+            (user_id, person_id, category, fact),
+        )
+        if existing:
+            return int(existing[0]["id"])
+    except Exception:
+        pass
+    try:
+        db_execute(
+            "INSERT INTO prospect_memory "
+            "  (user_id, person_id, fact, category, source, confidence) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (user_id, person_id, fact[:400], category,
+             (source or "")[:60], max(0, min(100, int(confidence)))),
+        )
+        # Mirror into the Letta memory organ (semantic long-term memory) — graceful:
+        # if Letta is unset/down this is a no-op and the DB row above still stands.
+        try:
+            from lib import letta_client
+            letta_client.store("person %s [%s]: %s" % (person_id, category, fact),
+                               tags={"user_id": user_id, "person_id": person_id, "category": category})
+        except Exception:
+            pass
+        return 1
+    except Exception as e:
+        log.debug(f"prospect_memory.remember failed: {e}")
+        return None
+
+
+_EXTRACT_SYSTEM = """\
+You are an expert sales analyst. Given the prospect's last reply (or a
+post they wrote publicly), extract every fact a top salesperson would
+write down to prepare the next call.
+
+Output STRICT JSON — no markdown, no commentary:
+{
+  "facts": [
+    {
+      "category": "pain" | "budget" | "timeline" | "stakeholder"
+                | "tool" | "quote" | "objection" | "commitment"
+                | "relationship",
+      "fact":      string (<= 200 chars, in their language if possible),
+      "confidence": number (50-100)
+    }
+  ]
+}
+
+Rules:
+- Only extract what the prospect ACTUALLY SAID. Don't invent.
+- A "quote" is verbatim text from them, in quotes.
+- A "pain" is a problem they explicitly named (frustration, cost,
+  blocker). Not a feature they liked.
+- A "budget" is any price/spend/cost number they mentioned, including
+  ranges or "we can't afford X".
+- A "stakeholder" is a named person/role they mentioned ("my CTO said",
+  "Marie thinks").
+- Keep facts short and atomic — one idea per fact.
+- If the reply is just thanks / a question / no info → return {"facts": []}.
+- Maximum 6 facts per call.
+"""
+
+
+def extract_from_reply(*, user_id: str, person_id: str,
+                        reply_body: str,
+                        source: str = "reply") -> list[dict[str, Any]]:
+    """Run the LLM extraction + persist every returned fact. Returns the
+    list of {category, fact, confidence} that landed."""
+    if not reply_body or len(reply_body.strip()) < 5:
+        return []
+    user_payload = json.dumps({"prospect_reply": reply_body[:4000]},
+                              ensure_ascii=False)
+    try:
+        raw = generate_json(_EXTRACT_SYSTEM, user_payload,
+                             max_tokens=700, temperature=0.2)
+    except Exception as e:
+        log.warning(f"memory extract LLM fail: {e}")
+        return []
+    facts = raw.get("facts") if isinstance(raw, dict) else None
+    if not isinstance(facts, list):
+        return []
+    persisted: list[dict[str, Any]] = []
+    for f in facts[:6]:
+        if not isinstance(f, dict):
+            continue
+        cat = (f.get("category") or "").lower().strip()
+        txt = (f.get("fact") or "").strip()
+        conf = int(f.get("confidence") or 70)
+        if cat not in CATEGORIES or not txt:
+            continue
+        if remember(user_id, person_id, txt, cat,    # type: ignore[arg-type]
+                     source=source, confidence=conf):
+            persisted.append({"category": cat, "fact": txt, "confidence": conf})
+    return persisted
+
+
+def recall(user_id: str, person_id: str, *,
+            max_per_cat: int = 3) -> dict[str, list[dict[str, Any]]]:
+    """Group recent facts by category for prompt injection."""
+    _ensure_table()
+    out: dict[str, list[dict[str, Any]]] = {c: [] for c in CATEGORIES}
+    try:
+        rows = db_query(
+            "SELECT category, fact, confidence, source, created_at "
+            " FROM prospect_memory "
+            " WHERE user_id = %s AND person_id = %s "
+            " ORDER BY created_at DESC",
+            (user_id, person_id),
+        )
+    except Exception:
+        rows = []
+    for r in (rows or []):
+        c = r.get("category")
+        if c not in out: continue
+        if len(out[c]) >= max_per_cat: continue
+        out[c].append({
+            "fact": r.get("fact"),
+            "confidence": int(r.get("confidence") or 0),
+            "source": r.get("source"),
+            "at": r["created_at"].isoformat() if r.get("created_at") else None,
+        })
+    return out
+
+
+def recall_summary(user_id: str, person_id: str,
+                    *, max_chars: int = 800) -> str:
+    """Compact bullet list of everything we know about this prospect —
+    ready to inject into a coach prompt."""
+    grouped = recall(user_id, person_id, max_per_cat=4)
+    lines: list[str] = []
+    for cat in CATEGORIES:
+        items = grouped.get(cat) or []
+        if not items: continue
+        for it in items:
+            line = f"- [{cat}] {it['fact']}"
+            if it.get("confidence") and it["confidence"] < 70:
+                line += "  (low conf)"
+            lines.append(line)
+    # Augment with Letta's semantic long-term memory (cross-session recall) — graceful:
+    # if Letta is unset/down, search() returns [] and this adds nothing.
+    try:
+        from lib import letta_client
+        for h in letta_client.search("memories about person %s" % person_id, k=3):
+            snip = h.split(" | ")[0].strip()   # drop the tags-json we appended at store time
+            if snip and snip not in "\n".join(lines):
+                lines.append("- [letta] " + snip[:160])
+    except Exception:
+        pass
+    text = "\n".join(lines)
+    return text[:max_chars] if len(text) > max_chars else text
